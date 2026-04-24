@@ -1,7 +1,10 @@
 package io.github.jordepic.icestream.indexer;
 
-import static org.apache.spark.sql.functions.col;
+import static com.datastax.spark.connector.japi.CassandraJavaUtil.javaFunctions;
+import static com.datastax.spark.connector.japi.CassandraJavaUtil.mapToRow;
+import static com.datastax.spark.connector.japi.CassandraJavaUtil.someColumns;
 
+import com.datastax.spark.connector.ColumnSelector;
 import io.github.jordepic.icestream.cassandra.CassandraIndex;
 import io.github.jordepic.icestream.cassandra.IndexEncoding;
 import io.github.jordepic.icestream.planner.DataFileRun;
@@ -24,17 +27,13 @@ import org.apache.iceberg.types.Types;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.RowFactory;
-import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.Metadata;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
 
 public final class DataFileIndexer {
+
+    private static final int PARTITIONS_PER_HOST = 10;
+    private static final ColumnSelector PARTITION_KEY_COLUMNS =
+            someColumns("spec_id", "partition_key", "bucket");
 
     private final SparkSession spark;
     private final CassandraIndex cassandra;
@@ -56,10 +55,21 @@ public final class DataFileIndexer {
 
         JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
         JavaRDD<FileWorkItem> workItemRdd = jsc.parallelize(workItems);
-        FlatMapFunction<FileWorkItem, Row> encode = item -> encodeFile(item, io, pkProjection, pkStructType, buckets);
-        JavaRDD<Row> indexRows = workItemRdd.flatMap(encode);
-        Dataset<Row> ds = spark.createDataFrame(indexRows.rdd(), indexSchema());
-        writeToCassandra(ds, id);
+        FlatMapFunction<FileWorkItem, IndexRow> encode =
+                item -> encodeFile(item, io, pkProjection, pkStructType, buckets);
+        JavaRDD<IndexRow> indexRows = workItemRdd.flatMap(encode);
+
+        JavaRDD<IndexRow> replicaRouted = javaFunctions(indexRows)
+                .repartitionByCassandraReplica(
+                        cassandra.keyspace(),
+                        cassandra.tableName(id),
+                        PARTITIONS_PER_HOST,
+                        PARTITION_KEY_COLUMNS,
+                        mapToRow(IndexRow.class));
+
+        javaFunctions(replicaRouted)
+                .writerBuilder(cassandra.keyspace(), cassandra.tableName(id), mapToRow(IndexRow.class))
+                .saveToCassandra();
     }
 
     private List<FileWorkItem> buildWorkItems(Table table, DataFileRun run) {
@@ -72,40 +82,19 @@ public final class DataFileIndexer {
         return items;
     }
 
-    private static Iterator<Row> encodeFile(
+    private static Iterator<IndexRow> encodeFile(
             FileWorkItem item, FileIO io, Schema pkProjection, Types.StructType pkStructType, int buckets)
             throws Exception {
-        List<Row> rows = new ArrayList<>();
+        List<IndexRow> rows = new ArrayList<>();
         try (CloseableIterable<Record> records = DataFileReader.read(io, item.dataFile, item.deletes, pkProjection)) {
             for (Record record : records) {
                 byte[] pkBytes = IndexEncoding.encodeStruct(pkStructType, record);
                 int bucket = IndexEncoding.bucket(pkBytes, buckets);
                 long pos = (Long) record.getField(MetadataColumns.ROW_POSITION.name());
-                rows.add(RowFactory.create(item.specId, item.partitionBytes, bucket, pkBytes, item.dataFilePath, pos));
+                rows.add(new IndexRow(item.specId, item.partitionBytes, bucket, pkBytes, item.dataFilePath, pos));
             }
         }
         return rows.iterator();
-    }
-
-    private void writeToCassandra(Dataset<Row> indexRows, TableIdentifier id) {
-        indexRows.repartition(col("spec_id"), col("partition_key"), col("bucket"))
-                .write()
-                .format("org.apache.spark.sql.cassandra")
-                .option("keyspace", cassandra.keyspace())
-                .option("table", cassandra.tableName(id))
-                .mode(SaveMode.Append)
-                .save();
-    }
-
-    private static StructType indexSchema() {
-        return new StructType(new StructField[] {
-            new StructField("spec_id", DataTypes.IntegerType, false, Metadata.empty()),
-            new StructField("partition_key", DataTypes.BinaryType, false, Metadata.empty()),
-            new StructField("bucket", DataTypes.IntegerType, false, Metadata.empty()),
-            new StructField("pk", DataTypes.BinaryType, false, Metadata.empty()),
-            new StructField("data_file_path", DataTypes.StringType, false, Metadata.empty()),
-            new StructField("pos", DataTypes.LongType, false, Metadata.empty())
-        });
     }
 
     private static final class FileWorkItem implements Serializable {
@@ -117,7 +106,8 @@ public final class DataFileIndexer {
         private final byte[] partitionBytes;
         private final String dataFilePath;
 
-        FileWorkItem(DataFile dataFile, List<DeleteFile> deletes, int specId, byte[] partitionBytes, String dataFilePath) {
+        FileWorkItem(
+                DataFile dataFile, List<DeleteFile> deletes, int specId, byte[] partitionBytes, String dataFilePath) {
             this.dataFile = dataFile;
             this.deletes = deletes;
             this.specId = specId;
