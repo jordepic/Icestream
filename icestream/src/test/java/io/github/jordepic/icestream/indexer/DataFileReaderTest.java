@@ -38,6 +38,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 class DataFileReaderTest {
 
@@ -64,9 +66,12 @@ class DataFileReaderTest {
         catalog.close();
     }
 
-    @Test
-    void noDeletes_returnsAllRows() throws IOException {
-        DataFile dataFile = writeDataFile(List.of(record(1L, "a"), record(2L, "b"), record(3L, "c")));
+    @ParameterizedTest
+    @EnumSource(
+            value = FileFormat.class,
+            names = {"PARQUET", "AVRO", "ORC"})
+    void noDeletes_returnsAllRows(FileFormat format) throws IOException {
+        DataFile dataFile = writeDataFile(format, List.of(record(1L, "a"), record(2L, "b"), record(3L, "c")));
 
         List<Record> rows = readRecords(dataFile, List.of());
 
@@ -77,9 +82,12 @@ class DataFileReaderTest {
                         org.assertj.core.groups.Tuple.tuple(3L, "c"));
     }
 
-    @Test
-    void deletionVectorFiltersReferencedPositions() throws IOException {
-        DataFile dataFile = writeDataFile(List.of(record(1L, "a"), record(2L, "b"), record(3L, "c")));
+    @ParameterizedTest
+    @EnumSource(
+            value = FileFormat.class,
+            names = {"PARQUET", "AVRO", "ORC"})
+    void deletionVectorFiltersReferencedPositions(FileFormat format) throws IOException {
+        DataFile dataFile = writeDataFile(format, List.of(record(1L, "a"), record(2L, "b"), record(3L, "c")));
         DeleteFile dv = writeDV(dataFile, List.of(1L));
 
         List<Record> rows = readRecords(dataFile, List.of(dv));
@@ -90,8 +98,11 @@ class DataFileReaderTest {
                         org.assertj.core.groups.Tuple.tuple(3L, "c"));
     }
 
-    @Test
-    void multipleOverlappingPosDeleteFilesMergeCorrectly() throws IOException {
+    @ParameterizedTest
+    @EnumSource(
+            value = FileFormat.class,
+            names = {"PARQUET", "AVRO", "ORC"})
+    void multipleOverlappingPosDeleteFilesMergeCorrectly(FileFormat posDeleteFormat) throws IOException {
         DataFile dataFile = writeDataFile(List.of(
                 record(10L, "a"),
                 record(20L, "b"),
@@ -99,9 +110,9 @@ class DataFileReaderTest {
                 record(40L, "d"),
                 record(50L, "e"),
                 record(60L, "f")));
-        DeleteFile posDel1 = writePosDeleteParquet(dataFile, List.of(0L, 2L));
-        DeleteFile posDel2 = writePosDeleteParquet(dataFile, List.of(2L, 4L));
-        DeleteFile posDel3 = writePosDeleteParquet(dataFile, List.of(4L, 5L));
+        DeleteFile posDel1 = writePosDeleteFile(posDeleteFormat, dataFile, List.of(0L, 2L));
+        DeleteFile posDel2 = writePosDeleteFile(posDeleteFormat, dataFile, List.of(2L, 4L));
+        DeleteFile posDel3 = writePosDeleteFile(posDeleteFormat, dataFile, List.of(4L, 5L));
 
         List<Record> rows = readRecords(dataFile, List.of(posDel1, posDel2, posDel3));
 
@@ -120,10 +131,14 @@ class DataFileReaderTest {
     }
 
     private DataFile writeDataFile(List<Record> rows) throws IOException {
-        OutputFile out = table.io().newOutputFile(newPath("data", "parquet"));
+        return writeDataFile(FileFormat.PARQUET, rows);
+    }
+
+    private DataFile writeDataFile(FileFormat format, List<Record> rows) throws IOException {
+        OutputFile out = table.io().newOutputFile(newPath("data", format.name().toLowerCase()));
         GenericAppenderFactory factory = new GenericAppenderFactory(table.schema(), table.spec());
         DataWriter<Record> writer =
-                factory.newDataWriter(EncryptedFiles.plainAsEncryptedOutput(out), FileFormat.PARQUET, null);
+                factory.newDataWriter(EncryptedFiles.plainAsEncryptedOutput(out), format, null);
         try (Closeable toClose = writer) {
             writer.write(rows);
         }
@@ -144,11 +159,12 @@ class DataFileReaderTest {
         return Iterables.getOnlyElement(writer.result().deleteFiles());
     }
 
-    private DeleteFile writePosDeleteParquet(DataFile dataFile, List<Long> deletedPositions) throws IOException {
-        OutputFile out = table.io().newOutputFile(newPath("posdel", "parquet"));
+    private DeleteFile writePosDeleteFile(FileFormat format, DataFile dataFile, List<Long> deletedPositions)
+            throws IOException {
+        OutputFile out = table.io().newOutputFile(newPath("posdel", format.name().toLowerCase()));
         GenericAppenderFactory factory = new GenericAppenderFactory(table.schema(), table.spec());
-        PositionDeleteWriter<Record> writer = factory.newPosDeleteWriter(
-                EncryptedFiles.plainAsEncryptedOutput(out), FileFormat.PARQUET, null);
+        PositionDeleteWriter<Record> writer =
+                factory.newPosDeleteWriter(EncryptedFiles.plainAsEncryptedOutput(out), format, null);
         PositionDelete<Record> delete = PositionDelete.create();
         try (Closeable toClose = writer) {
             for (Long pos : deletedPositions) {
