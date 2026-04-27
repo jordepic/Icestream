@@ -31,7 +31,6 @@ import org.apache.spark.sql.SparkSession;
 
 public final class DataFileIndexer {
 
-    private static final int PARTITIONS_PER_HOST = 10;
     private static final ColumnSelector PARTITION_KEY_COLUMNS =
             someColumns("spec_id", "partition_key", "bucket");
 
@@ -63,7 +62,7 @@ public final class DataFileIndexer {
                 .repartitionByCassandraReplica(
                         cassandra.keyspace(),
                         cassandra.tableName(id),
-                        PARTITIONS_PER_HOST,
+                        config.cassandraPartitionsPerHost(),
                         PARTITION_KEY_COLUMNS,
                         mapToRow(IndexRow.class));
 
@@ -76,7 +75,7 @@ public final class DataFileIndexer {
         List<FileWorkItem> items = new ArrayList<>(run.files().size());
         for (DataFile file : run.files()) {
             PartitionSpec spec = table.specs().get(file.specId());
-            byte[] partitionBytes = IndexEncoding.encodeStruct(spec.partitionType(), file.partition());
+            byte[] partitionBytes = IndexEncoding.encodeAsAvroBytes(spec.partitionType(), file.partition());
             items.add(new FileWorkItem(file, run.deletesFor(file), file.specId(), partitionBytes, file.location()));
         }
         return items;
@@ -88,7 +87,7 @@ public final class DataFileIndexer {
         List<IndexRow> rows = new ArrayList<>();
         try (CloseableIterable<Record> records = DataFileReader.read(io, item.dataFile, item.deletes, pkProjection)) {
             for (Record record : records) {
-                byte[] pkBytes = IndexEncoding.encodeStruct(pkStructType, record);
+                byte[] pkBytes = IndexEncoding.encodeAsAvroBytes(pkStructType, record);
                 int bucket = IndexEncoding.bucket(pkBytes, buckets);
                 long pos = (Long) record.getField(MetadataColumns.ROW_POSITION.name());
                 rows.add(new IndexRow(item.specId, item.partitionBytes, bucket, pkBytes, item.dataFilePath, pos));

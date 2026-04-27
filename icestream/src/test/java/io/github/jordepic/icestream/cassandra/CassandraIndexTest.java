@@ -59,17 +59,17 @@ class CassandraIndexTest {
         index.createIfAbsent(table);
 
         Map<String, Row> columns = fetchColumns("db_t");
-        assertThat(columns).containsOnlyKeys("spec_id", "partition_key", "bucket", "pk", "data_file_path", "pos");
+        assertThat(columns).containsOnlyKeys("spec_id", "partition_key", "bucket", "serialized_delete_condition", "data_file_path", "pos");
         assertThat(columns.get("spec_id").getString("kind")).isEqualTo("partition_key");
         assertThat(columns.get("partition_key").getString("kind")).isEqualTo("partition_key");
         assertThat(columns.get("bucket").getString("kind")).isEqualTo("partition_key");
-        assertThat(columns.get("pk").getString("kind")).isEqualTo("clustering");
+        assertThat(columns.get("serialized_delete_condition").getString("kind")).isEqualTo("clustering");
         assertThat(columns.get("data_file_path").getString("kind")).isEqualTo("regular");
         assertThat(columns.get("pos").getString("kind")).isEqualTo("regular");
         assertThat(columns.get("spec_id").getString("type")).isEqualTo("int");
         assertThat(columns.get("partition_key").getString("type")).isEqualTo("blob");
         assertThat(columns.get("bucket").getString("type")).isEqualTo("int");
-        assertThat(columns.get("pk").getString("type")).isEqualTo("blob");
+        assertThat(columns.get("serialized_delete_condition").getString("type")).isEqualTo("blob");
         assertThat(columns.get("data_file_path").getString("type")).isEqualTo("text");
         assertThat(columns.get("pos").getString("type")).isEqualTo("bigint");
     }

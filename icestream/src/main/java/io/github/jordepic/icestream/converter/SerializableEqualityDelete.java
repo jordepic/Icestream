@@ -1,12 +1,13 @@
-package io.github.jordepic.icestream.indexer;
+package io.github.jordepic.icestream.converter;
 
 import java.io.Serializable;
 
 /**
- * JavaBean holding one Cassandra index row. Field names follow JavaBean camelCase; the Cassandra
- * connector's default JavaBeanColumnMapper maps them to the snake_case table columns.
+ * JavaBean carrying the four Cassandra partition+clustering columns we use to look up an
+ * (eq-delete pk) → (data_file_path, pos) entry. The Cassandra connector's default
+ * JavaBeanColumnMapper maps camelCase fields to the snake_case table columns.
  */
-public final class IndexRow implements Serializable {
+public final class SerializableEqualityDelete implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
@@ -14,24 +15,14 @@ public final class IndexRow implements Serializable {
     private byte[] partitionKey;
     private int bucket;
     private byte[] serializedDeleteCondition;
-    private String dataFilePath;
-    private long pos;
 
-    public IndexRow() {}
+    public SerializableEqualityDelete() {}
 
-    public IndexRow(
-            int specId,
-            byte[] partitionKey,
-            int bucket,
-            byte[] serializedDeleteCondition,
-            String dataFilePath,
-            long pos) {
+    public SerializableEqualityDelete(int specId, byte[] partitionKey, int bucket, byte[] serializedDeleteCondition) {
         this.specId = specId;
         this.partitionKey = partitionKey;
         this.bucket = bucket;
         this.serializedDeleteCondition = serializedDeleteCondition;
-        this.dataFilePath = dataFilePath;
-        this.pos = pos;
     }
 
     public int getSpecId() {
@@ -64,21 +55,5 @@ public final class IndexRow implements Serializable {
 
     public void setSerializedDeleteCondition(byte[] serializedDeleteCondition) {
         this.serializedDeleteCondition = serializedDeleteCondition;
-    }
-
-    public String getDataFilePath() {
-        return dataFilePath;
-    }
-
-    public void setDataFilePath(String dataFilePath) {
-        this.dataFilePath = dataFilePath;
-    }
-
-    public long getPos() {
-        return pos;
-    }
-
-    public void setPos(long pos) {
-        this.pos = pos;
     }
 }

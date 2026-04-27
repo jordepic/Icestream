@@ -11,46 +11,70 @@ import org.junit.jupiter.api.Test;
 class IndexEncodingTest {
 
     @Test
-    void encodeStruct_emptyStruct_returnsEmptyBytes() {
+    void encodeStruct_emptyAsAvroBytes_returnsEmptyBytes() {
         Types.StructType type = Types.StructType.of();
 
-        byte[] bytes = IndexEncoding.encodeStruct(type, new SimpleStruct());
+        byte[] bytes = IndexEncoding.encodeAsAvroBytes(type, new SimpleStruct());
 
         assertThat(bytes).isEmpty();
     }
 
     @Test
-    void encodeStruct_isDeterministicForSameInput() {
+    void encodeAsAvroBytes_isDeterministicForSameInput() {
         Types.StructType type = Types.StructType.of(
                 NestedField.required(1, "id", Types.LongType.get()),
                 NestedField.required(2, "name", Types.StringType.get()));
 
-        byte[] first = IndexEncoding.encodeStruct(type, new SimpleStruct(42L, "alice"));
-        byte[] second = IndexEncoding.encodeStruct(type, new SimpleStruct(42L, "alice"));
+        byte[] first = IndexEncoding.encodeAsAvroBytes(type, new SimpleStruct(42L, "alice"));
+        byte[] second = IndexEncoding.encodeAsAvroBytes(type, new SimpleStruct(42L, "alice"));
 
         assertThat(first).isEqualTo(second);
     }
 
     @Test
-    void encodeStruct_fieldOrderAffectsOutput() {
+    void encodeAsAvroBytes_fieldOrderAffectsOutput() {
         Types.StructType type = Types.StructType.of(
                 NestedField.required(1, "a", Types.IntegerType.get()),
                 NestedField.required(2, "b", Types.IntegerType.get()));
 
-        byte[] left = IndexEncoding.encodeStruct(type, new SimpleStruct(1, 2));
-        byte[] right = IndexEncoding.encodeStruct(type, new SimpleStruct(2, 1));
+        byte[] left = IndexEncoding.encodeAsAvroBytes(type, new SimpleStruct(1, 2));
+        byte[] right = IndexEncoding.encodeAsAvroBytes(type, new SimpleStruct(2, 1));
 
         assertThat(left).isNotEqualTo(right);
     }
 
     @Test
-    void encodeStruct_nullFieldDiffersFromZeroField() {
+    void encodeAsAvroBytes_nullFieldDiffersFromZeroField() {
         Types.StructType type = Types.StructType.of(NestedField.optional(1, "id", Types.LongType.get()));
 
-        byte[] withNull = IndexEncoding.encodeStruct(type, new SimpleStruct((Object) null));
-        byte[] withZero = IndexEncoding.encodeStruct(type, new SimpleStruct(0L));
+        byte[] withNull = IndexEncoding.encodeAsAvroBytes(type, new SimpleStruct((Object) null));
+        byte[] withZero = IndexEncoding.encodeAsAvroBytes(type, new SimpleStruct(0L));
 
         assertThat(withNull).isNotEqualTo(withZero);
+    }
+
+    @Test
+    void decodeFromAvroBytes_roundTripsValuesAndNulls() {
+        Types.StructType type = Types.StructType.of(
+                NestedField.required(1, "id", Types.LongType.get()),
+                NestedField.optional(2, "name", Types.StringType.get()),
+                NestedField.optional(3, "missing", Types.StringType.get()));
+
+        byte[] bytes = IndexEncoding.encodeAsAvroBytes(type, new SimpleStruct(42L, "alice", null));
+        StructLike decoded = IndexEncoding.decodeFromAvroBytes(type, bytes);
+
+        assertThat(decoded.get(0, Long.class)).isEqualTo(42L);
+        assertThat(decoded.get(1, CharSequence.class)).hasToString("alice");
+        assertThat(decoded.get(2, CharSequence.class)).isNull();
+    }
+
+    @Test
+    void decodeFromAvroBytes_emptyStructReturnsEmptyRecord() {
+        Types.StructType type = Types.StructType.of();
+
+        StructLike decoded = IndexEncoding.decodeFromAvroBytes(type, new byte[0]);
+
+        assertThat(decoded.size()).isZero();
     }
 
     @Test

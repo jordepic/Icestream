@@ -125,7 +125,8 @@ class DataFileIndexerTest {
 
         List<Row> rows = fetchIndexRows(id);
         assertThat(rows).hasSize(2);
-        assertThat(rows.stream().map(r -> r.getByteBuffer("pk")).distinct()).hasSize(2);
+        assertThat(rows.stream().map(r -> r.getByteBuffer("serialized_delete_condition")).distinct())
+                .hasSize(2);
         assertThat(rows).extracting(r -> r.getInt("spec_id")).containsOnly(0);
         assertThat(rows).extracting(r -> r.getByteBuffer("partition_key")).containsOnly(ByteBuffer.wrap(new byte[0]));
         assertThat(rows).extracting(r -> r.getString("data_file_path")).containsOnly(dataFile.location());

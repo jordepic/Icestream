@@ -37,9 +37,9 @@ public final class CassandraIndex {
                 + "spec_id int, "
                 + "partition_key blob, "
                 + "bucket int, "
-                + "pk blob, "
+                + "serialized_delete_condition blob, "
                 + "data_file_path text, "
                 + "pos bigint, "
-                + "PRIMARY KEY ((spec_id, partition_key, bucket), pk))");
+                + "PRIMARY KEY ((spec_id, partition_key, bucket), serialized_delete_condition))");
     }
 }
