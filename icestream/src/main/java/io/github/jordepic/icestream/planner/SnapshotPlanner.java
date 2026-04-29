@@ -10,6 +10,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -26,6 +27,10 @@ import org.apache.iceberg.io.CloseableIterable;
 public final class SnapshotPlanner {
 
     private static final int MINIMUM_REQUIRED_FORMAT_VERSION = 3;
+
+    public Optional<FileRun> planNextRun(Table table, State lastProcessed) {
+        return plan(table, lastProcessed).stream().findFirst();
+    }
 
     public List<FileRun> plan(Table table, State lastProcessed) {
         validateFormatVersion(table);

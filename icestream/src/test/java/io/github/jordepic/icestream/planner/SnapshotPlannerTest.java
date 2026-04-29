@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.AppendFiles;
@@ -297,6 +298,29 @@ class SnapshotPlannerTest {
         assertThatThrownBy(() -> planner.plan(table, State.INITIAL))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("cassandra-buckets");
+    }
+
+    @Test
+    void planNextRun_returnsFirstRunInOrder() {
+        Table table = createV3Table();
+        appendData(table, dataFile());
+        appendDeletes(table, eqDeleteWithFieldIds(1));
+
+        Optional<FileRun> next = planner.planNextRun(table, State.INITIAL);
+
+        assertThat(next).hasValueSatisfying(run -> {
+            assertThat(run.kind()).isEqualTo(FileKind.DATA);
+            assertThat(run.maxSeq()).isEqualTo(1L);
+        });
+    }
+
+    @Test
+    void planNextRun_emptyWhenNoWork() {
+        Table table = createV3Table();
+
+        Optional<FileRun> next = planner.planNextRun(table, State.INITIAL);
+
+        assertThat(next).isEmpty();
     }
 
     private Table createV3Table() {
