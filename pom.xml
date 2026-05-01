@@ -11,6 +11,7 @@
 
     <modules>
         <module>icestream</module>
+        <module>icestream-it</module>
     </modules>
 
     <properties>
@@ -20,6 +21,10 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
         <iceberg.version>1.10.1</iceberg.version>
+        <flink.version>2.0.0</flink.version>
+        <flink.iceberg.connector.version>2.0</flink.iceberg.connector.version>
+        <flink.kafka.connector.version>4.0.1-2.0</flink.kafka.connector.version>
+        <kafka.client.version>3.7.0</kafka.client.version>
         <parquet.version>1.17.0</parquet.version>
         <spark.version>3.5.4</spark.version>
         <spark.scala.version>2.12</spark.scala.version>

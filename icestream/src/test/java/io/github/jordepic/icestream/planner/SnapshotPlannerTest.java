@@ -264,9 +264,9 @@ class SnapshotPlannerTest {
     }
 
     @Test
-    void nonV3Table_failsLoud() {
+    void v1Table_failsLoud() {
         Map<String, String> props = defaultProps();
-        props.put(TableProperties.FORMAT_VERSION, "2");
+        props.put(TableProperties.FORMAT_VERSION, "1");
         Table table = catalog.createTable(TABLE, SCHEMA, PartitionSpec.unpartitioned(), props);
 
         assertThatThrownBy(() -> planner.plan(table, State.INITIAL))

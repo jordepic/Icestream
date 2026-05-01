@@ -26,7 +26,7 @@ import org.apache.iceberg.io.CloseableIterable;
 
 public final class SnapshotPlanner {
 
-    private static final int MINIMUM_REQUIRED_FORMAT_VERSION = 3;
+    private static final int MINIMUM_REQUIRED_FORMAT_VERSION = 2;
 
     public Optional<FileRun> planNextRun(Table table, State lastProcessed) {
         return plan(table, lastProcessed).stream().findFirst();
@@ -48,7 +48,7 @@ public final class SnapshotPlanner {
         int version = ((HasTableOperations) table).operations().current().formatVersion();
         if (version < MINIMUM_REQUIRED_FORMAT_VERSION) {
             throw new IllegalStateException(
-                    "Table " + table.name() + " format-version is " + version + "; icestream requires v3 or higher");
+                    "Table " + table.name() + " format-version is " + version + "; icestream requires v2 or higher");
         }
     }
 
