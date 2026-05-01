@@ -35,6 +35,8 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.deletes.BaseDVFileWriter;
 import org.apache.iceberg.deletes.DVFileWriter;
 import org.apache.iceberg.deletes.EqualityDeleteWriter;
+import org.apache.iceberg.io.FanoutPositionOnlyDeleteWriter;
+import org.apache.iceberg.util.ContentFileUtil;
 import org.apache.iceberg.encryption.EncryptedFiles;
 import org.apache.iceberg.hadoop.HadoopCatalog;
 import org.apache.iceberg.io.DataWriter;
@@ -134,9 +136,9 @@ class DeleteFileCreatorTest {
                 TABLE_ID, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), IcestreamTableConfig.from(table));
 
         assertThat(plan.eqDeletesToRemove()).containsExactly(eqDelete);
-        assertThat(plan.existingDvsToRemove()).isEmpty();
-        assertThat(plan.newDvsToAdd()).hasSize(1);
-        DeleteFile newDv = plan.newDvsToAdd().get(0);
+        assertThat(plan.existingDeletesToRemove()).isEmpty();
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        DeleteFile newDv = plan.deletesToAdd().get(0);
         assertThat(newDv.format()).isEqualTo(FileFormat.PUFFIN);
         assertThat(newDv.referencedDataFile()).isEqualTo(dataFile.location());
         assertThat(newDv.recordCount()).isEqualTo(1L);
@@ -161,9 +163,9 @@ class DeleteFileCreatorTest {
         CommitPlan plan = creator.create(
                 TABLE_ID, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), IcestreamTableConfig.from(table));
 
-        assertThat(plan.newDvsToAdd()).hasSize(1);
-        assertThat(plan.newDvsToAdd().get(0).recordCount()).isEqualTo(3L);
-        assertThat(plan.newDvsToAdd().get(0).referencedDataFile()).isEqualTo(dataFile.location());
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        assertThat(plan.deletesToAdd().get(0).recordCount()).isEqualTo(3L);
+        assertThat(plan.deletesToAdd().get(0).referencedDataFile()).isEqualTo(dataFile.location());
     }
 
     @Test
@@ -176,8 +178,8 @@ class DeleteFileCreatorTest {
         CommitPlan plan = creator.create(
                 TABLE_ID, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), IcestreamTableConfig.from(table));
 
-        assertThat(plan.newDvsToAdd()).isEmpty();
-        assertThat(plan.existingDvsToRemove()).isEmpty();
+        assertThat(plan.deletesToAdd()).isEmpty();
+        assertThat(plan.existingDeletesToRemove()).isEmpty();
         assertThat(plan.eqDeletesToRemove()).containsExactly(eqDelete);
     }
 
@@ -197,11 +199,11 @@ class DeleteFileCreatorTest {
         CommitPlan plan = creator.create(
                 TABLE_ID, table, new EqualityDeleteFileRun(3L, List.of(eqDelete)), IcestreamTableConfig.from(table));
 
-        assertThat(plan.newDvsToAdd()).hasSize(2);
-        assertThat(plan.newDvsToAdd())
+        assertThat(plan.deletesToAdd()).hasSize(2);
+        assertThat(plan.deletesToAdd())
                 .extracting(d -> d.referencedDataFile().toString())
                 .containsExactlyInAnyOrder(first.location(), second.location());
-        assertThat(plan.newDvsToAdd()).extracting(DeleteFile::recordCount).containsOnly(1L);
+        assertThat(plan.deletesToAdd()).extracting(DeleteFile::recordCount).containsOnly(1L);
     }
 
     @Test
@@ -220,9 +222,9 @@ class DeleteFileCreatorTest {
         CommitPlan plan = creator.create(
                 TABLE_ID, table, new EqualityDeleteFileRun(3L, List.of(eqDelete)), IcestreamTableConfig.from(table));
 
-        assertThat(plan.newDvsToAdd()).hasSize(1);
-        assertThat(plan.newDvsToAdd().get(0).recordCount()).isEqualTo(2L);
-        assertThat(plan.existingDvsToRemove())
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        assertThat(plan.deletesToAdd().get(0).recordCount()).isEqualTo(2L);
+        assertThat(plan.existingDeletesToRemove())
                 .extracting(d -> d.location().toString())
                 .containsExactly(existingDv.location());
     }
@@ -240,8 +242,8 @@ class DeleteFileCreatorTest {
         CommitPlan plan = creator.create(
                 TABLE_ID, table, new EqualityDeleteFileRun(3L, List.of(engEqDelete)), IcestreamTableConfig.from(table));
 
-        assertThat(plan.newDvsToAdd()).hasSize(1);
-        assertThat(plan.newDvsToAdd().get(0).referencedDataFile()).isEqualTo(engFile.location());
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        assertThat(plan.deletesToAdd().get(0).referencedDataFile()).isEqualTo(engFile.location());
     }
 
     @Test
@@ -255,8 +257,8 @@ class DeleteFileCreatorTest {
         CommitPlan plan = creator.create(
                 TABLE_ID, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), IcestreamTableConfig.from(table));
 
-        assertThat(plan.newDvsToAdd()).hasSize(1);
-        DeleteFile newDv = plan.newDvsToAdd().get(0);
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        DeleteFile newDv = plan.deletesToAdd().get(0);
         assertThat(newDv.specId()).isEqualTo(table.spec().specId());
         assertThat(newDv.partition().get(0, CharSequence.class)).hasToString("eng");
     }
@@ -272,9 +274,9 @@ class DeleteFileCreatorTest {
         CommitPlan plan = creator.create(
                 TABLE_ID, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), IcestreamTableConfig.from(table));
 
-        assertThat(plan.newDvsToAdd()).hasSize(1);
-        assertThat(plan.newDvsToAdd().get(0).recordCount()).isEqualTo(1L);
-        assertThat(plan.newDvsToAdd().get(0).referencedDataFile()).isEqualTo(dataFile.location());
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        assertThat(plan.deletesToAdd().get(0).recordCount()).isEqualTo(1L);
+        assertThat(plan.deletesToAdd().get(0).referencedDataFile()).isEqualTo(dataFile.location());
     }
 
     @Test
@@ -288,9 +290,9 @@ class DeleteFileCreatorTest {
         CommitPlan plan = creator.create(
                 TABLE_ID, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), IcestreamTableConfig.from(table));
 
-        assertThat(plan.newDvsToAdd()).hasSize(1);
-        assertThat(plan.newDvsToAdd().get(0).recordCount()).isEqualTo(1L);
-        assertThat(plan.newDvsToAdd().get(0).referencedDataFile()).isEqualTo(dataFile.location());
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        assertThat(plan.deletesToAdd().get(0).recordCount()).isEqualTo(1L);
+        assertThat(plan.deletesToAdd().get(0).referencedDataFile()).isEqualTo(dataFile.location());
     }
 
     @Test
@@ -307,10 +309,9 @@ class DeleteFileCreatorTest {
                 IndexEncoding.encodeAsAvroBytes(table.specs().get(eqDelete.specId()).partitionType(), eqDelete.partition()));
         JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
         Broadcast<Table> tableBroadcast = jsc.broadcast(SerializableTable.copyOf(table));
-        Broadcast<Map<String, DvInfo>> dvInfoBroadcast = jsc.broadcast(Map.of());
 
-        JavaRDD<DeleteFile> pipeline =
-                creator.buildDvWritePipeline(TABLE_ID, List.of(workItem), config, tableBroadcast, dvInfoBroadcast);
+        org.apache.spark.api.java.JavaPairRDD<String, PerPositionMatch> pipeline =
+                creator.buildJoinPipeline(TABLE_ID, List.of(workItem), config, tableBroadcast);
 
         String lineage = pipeline.toDebugString();
         assertThat(lineage).contains("CassandraJoinRDD");
@@ -436,5 +437,291 @@ class DeleteFileCreatorTest {
         props.put(IcestreamProperties.PRIMARY_KEYS, "id");
         props.put(IcestreamProperties.CASSANDRA_BUCKETS, "4");
         return props;
+    }
+
+    private Map<String, String> v2Props() {
+        Map<String, String> props = new HashMap<>();
+        props.put(TableProperties.FORMAT_VERSION, "2");
+        props.put(IcestreamProperties.PRIMARY_KEYS, "id");
+        props.put(IcestreamProperties.CASSANDRA_BUCKETS, "4");
+        return props;
+    }
+
+    @Test
+    void v2_eqDelete_convertsToParquetPosDeleteFile() throws IOException {
+        Table table = createUnpartitionedV2Table();
+        DataFile dataFile = writeUnpartitionedDataFile(
+                table, List.of(unpartitionedRecord(1L, "alice"), unpartitionedRecord(2L, "bob")));
+        indexAndCommitDataFile(table, dataFile);
+        DeleteFile eqDelete = writeEqDelete(table, FileFormat.PARQUET, null, List.of(unpartitionedRecord(2L, null)));
+
+        CommitPlan plan = creator.create(
+                TABLE_ID, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), IcestreamTableConfig.from(table));
+
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        DeleteFile newPosDelete = plan.deletesToAdd().get(0);
+        assertThat(newPosDelete.format()).isEqualTo(FileFormat.PARQUET);
+        assertThat(ContentFileUtil.referencedDataFile(newPosDelete).toString()).isEqualTo(dataFile.location());
+        assertThat(newPosDelete.recordCount()).isEqualTo(1L);
+        assertThat(plan.existingDeletesToRemove()).isEmpty();
+    }
+
+    @Test
+    void v2_honorsWriteDeleteFormatAvro() throws IOException {
+        Map<String, String> props = v2Props();
+        props.put(TableProperties.DELETE_DEFAULT_FILE_FORMAT, "avro");
+        Table table = catalog.createTable(TABLE_ID, UNPARTITIONED_SCHEMA, PartitionSpec.unpartitioned(), props);
+        index.createIfAbsent(TABLE_ID);
+        DataFile dataFile = writeUnpartitionedDataFile(table, List.of(unpartitionedRecord(1L, "alice")));
+        indexAndCommitDataFile(table, dataFile);
+        DeleteFile eqDelete = writeEqDelete(table, FileFormat.PARQUET, null, List.of(unpartitionedRecord(1L, null)));
+
+        CommitPlan plan = creator.create(
+                TABLE_ID, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), IcestreamTableConfig.from(table));
+
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        assertThat(plan.deletesToAdd().get(0).format()).isEqualTo(FileFormat.AVRO);
+    }
+
+    @Test
+    void v2_mergesWithExistingFileScopedPosDelete() throws IOException {
+        Table table = createUnpartitionedV2Table();
+        DataFile dataFile = writeUnpartitionedDataFile(table,
+                List.of(unpartitionedRecord(1L, "alice"), unpartitionedRecord(2L, "bob"), unpartitionedRecord(3L, "carol")));
+        indexAndCommitDataFile(table, dataFile);
+
+        DeleteFile existingPosDelete = writeAndCommitFileScopedPosDelete(table, dataFile, List.of(0L));
+        DeleteFile eqDelete = writeEqDelete(table, FileFormat.PARQUET, null, List.of(unpartitionedRecord(3L, null)));
+
+        CommitPlan plan = creator.create(
+                TABLE_ID, table, new EqualityDeleteFileRun(3L, List.of(eqDelete)), IcestreamTableConfig.from(table));
+
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        DeleteFile merged = plan.deletesToAdd().get(0);
+        assertThat(merged.format()).isEqualTo(FileFormat.PARQUET);
+        assertThat(ContentFileUtil.referencedDataFile(merged).toString()).isEqualTo(dataFile.location());
+        assertThat(merged.recordCount()).as("merged file contains the existing position 0 plus the new position 2").isEqualTo(2L);
+        assertThat(plan.existingDeletesToRemove())
+                .extracting(DeleteFile::location)
+                .containsExactly(existingPosDelete.location());
+    }
+
+    @Test
+    void v2_unscopedExistingPosDelete_isLeftAlone() throws IOException {
+        Table table = createUnpartitionedV2Table();
+        DataFile dataFileA = writeUnpartitionedDataFile(
+                table, List.of(unpartitionedRecord(1L, "alice"), unpartitionedRecord(2L, "bob")));
+        DataFile dataFileB = writeUnpartitionedDataFile(table, List.of(unpartitionedRecord(3L, "carol")));
+        indexAndCommitDataFiles(table, List.of(dataFileA, dataFileB));
+
+        DeleteFile unscopedPosDelete = writeAndCommitUnscopedPosDelete(
+                table,
+                List.of(new PosDeletePos(dataFileA.location(), 0L), new PosDeletePos(dataFileB.location(), 0L)));
+        assertThat(ContentFileUtil.referencedDataFile(unscopedPosDelete))
+                .as("baseline: an unscoped pos-delete file references no specific data file")
+                .isNull();
+
+        DeleteFile eqDelete = writeEqDelete(table, FileFormat.PARQUET, null, List.of(unpartitionedRecord(2L, null)));
+
+        CommitPlan plan = creator.create(
+                TABLE_ID, table, new EqualityDeleteFileRun(4L, List.of(eqDelete)), IcestreamTableConfig.from(table));
+
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        assertThat(ContentFileUtil.referencedDataFile(plan.deletesToAdd().get(0)).toString())
+                .isEqualTo(dataFileA.location());
+        assertThat(plan.existingDeletesToRemove())
+                .as("unscoped pos-delete files are not absorbed; they remain alongside")
+                .extracting(DeleteFile::location)
+                .doesNotContain(unscopedPosDelete.location());
+    }
+
+    @Test
+    void v2_multipleEqDeleteFilesOnOneDataFile_squashedIntoSinglePosDeleteFile() throws IOException {
+        Table table = createUnpartitionedV2Table();
+        DataFile dataFile = writeUnpartitionedDataFile(
+                table,
+                List.of(unpartitionedRecord(1L, "a"), unpartitionedRecord(2L, "b"), unpartitionedRecord(3L, "c")));
+        indexAndCommitDataFile(table, dataFile);
+        DeleteFile eqDelete1 = writeEqDelete(table, FileFormat.PARQUET, null, List.of(unpartitionedRecord(1L, null)));
+        DeleteFile eqDelete2 = writeEqDelete(table, FileFormat.PARQUET, null, List.of(unpartitionedRecord(3L, null)));
+
+        CommitPlan plan = creator.create(
+                TABLE_ID,
+                table,
+                new EqualityDeleteFileRun(2L, List.of(eqDelete1, eqDelete2)),
+                IcestreamTableConfig.from(table));
+
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        DeleteFile squashed = plan.deletesToAdd().get(0);
+        assertThat(squashed.recordCount())
+                .as("two eq-delete files contributing positions 0 and 2 should produce one merged pos-delete with 2 entries")
+                .isEqualTo(2L);
+        assertThat(ContentFileUtil.referencedDataFile(squashed).toString()).isEqualTo(dataFile.location());
+    }
+
+    @Test
+    void v2_partitionedTable_posDeleteFileLocationContainsPartitionPath() throws IOException {
+        Table table = catalog.createTable(
+                TABLE_ID,
+                PARTITIONED_SCHEMA,
+                PartitionSpec.builderFor(PARTITIONED_SCHEMA).identity("dept").build(),
+                v2Props());
+        index.createIfAbsent(TABLE_ID);
+        DataFile engFile = writePartitionedDataFile(table, "eng", List.of(partitionedRecord(1L, "eng")));
+        indexAndCommitDataFile(table, engFile);
+        DeleteFile eqDelete = writeEqDelete(
+                table, FileFormat.PARQUET, partition("eng"), List.of(partitionedRecord(1L, "eng")));
+
+        CommitPlan plan = creator.create(
+                TABLE_ID, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), IcestreamTableConfig.from(table));
+
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        assertThat(plan.deletesToAdd().get(0).location())
+                .as("output pos-delete file should be laid out under the data file's partition path")
+                .contains("dept=eng");
+    }
+
+    @Test
+    void v2_writtenDeletesAreFileScoped() throws IOException {
+        Table table = createUnpartitionedV2Table();
+        DataFile dataFile = writeUnpartitionedDataFile(
+                table, List.of(unpartitionedRecord(1L, "alice"), unpartitionedRecord(2L, "bob")));
+        indexAndCommitDataFile(table, dataFile);
+        DeleteFile eqDelete = writeEqDelete(table, FileFormat.PARQUET, null, List.of(unpartitionedRecord(2L, null)));
+
+        CommitPlan plan = creator.create(
+                TABLE_ID, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), IcestreamTableConfig.from(table));
+
+        assertThat(plan.deletesToAdd()).hasSize(1);
+        assertThat(ContentFileUtil.isFileScoped(plan.deletesToAdd().get(0))).isTrue();
+    }
+
+    @Test
+    void v2_partitionedTable_emitsPerPartitionPosDeleteFiles() throws IOException {
+        Table table = catalog.createTable(TABLE_ID, PARTITIONED_SCHEMA,
+                PartitionSpec.builderFor(PARTITIONED_SCHEMA).identity("dept").build(), v2Props());
+        index.createIfAbsent(TABLE_ID);
+        DataFile engFile = writePartitionedDataFile(table, "eng", List.of(partitionedRecord(1L, "eng")));
+        DataFile salesFile = writePartitionedDataFile(table, "sales", List.of(partitionedRecord(2L, "sales")));
+        indexAndCommitDataFiles(table, List.of(engFile, salesFile));
+
+        DeleteFile engEqDelete = writeEqDelete(
+                table, FileFormat.PARQUET, partition("eng"), List.of(partitionedRecord(1L, "eng")));
+        DeleteFile salesEqDelete = writeEqDelete(
+                table, FileFormat.PARQUET, partition("sales"), List.of(partitionedRecord(2L, "sales")));
+
+        CommitPlan plan = creator.create(
+                TABLE_ID, table,
+                new EqualityDeleteFileRun(3L, List.of(engEqDelete, salesEqDelete)),
+                IcestreamTableConfig.from(table));
+
+        assertThat(plan.deletesToAdd()).hasSize(2);
+        assertThat(plan.deletesToAdd())
+                .extracting(d -> ContentFileUtil.referencedDataFile(d) == null
+                        ? null
+                        : ContentFileUtil.referencedDataFile(d).toString())
+                .containsExactlyInAnyOrder(engFile.location(), salesFile.location());
+    }
+
+    private Table createUnpartitionedV2Table() {
+        Table table = catalog.createTable(TABLE_ID, UNPARTITIONED_SCHEMA, PartitionSpec.unpartitioned(), v2Props());
+        index.createIfAbsent(TABLE_ID);
+        return table;
+    }
+
+    /** Writes a parquet pos-delete file with referencedDataFile set (FILE-scoped) and commits it. */
+    private DeleteFile writeAndCommitFileScopedPosDelete(Table table, DataFile dataFile, List<Long> positions)
+            throws IOException {
+        OutputFileFactory fileFactory = OutputFileFactory.builderFor(table, 1, pathCounter.incrementAndGet())
+                .format(FileFormat.PARQUET)
+                .build();
+        FanoutPositionOnlyDeleteWriter<Record> writer = new FanoutPositionOnlyDeleteWriter<>(
+                new TestPosDeleteWriterFactory(table, FileFormat.PARQUET),
+                fileFactory, table.io(), 64L * 1024 * 1024,
+                org.apache.iceberg.deletes.DeleteGranularity.FILE);
+        org.apache.iceberg.deletes.PositionDelete<Record> positionDelete =
+                org.apache.iceberg.deletes.PositionDelete.create();
+        try {
+            for (Long pos : positions) {
+                positionDelete.set(dataFile.location(), pos, null);
+                writer.write(positionDelete, table.spec(), null);
+            }
+        } finally {
+            writer.close();
+        }
+        DeleteFile delete = Iterables.getOnlyElement(writer.result().deleteFiles());
+        table.newRowDelta().addDeletes(delete).commit();
+        return delete;
+    }
+
+    /** A pos-delete with referencedDataFile == null (PARTITION granularity), referencing N data files. */
+    private DeleteFile writeAndCommitUnscopedPosDelete(Table table, List<PosDeletePos> positions) throws IOException {
+        OutputFileFactory fileFactory = OutputFileFactory.builderFor(table, 1, pathCounter.incrementAndGet())
+                .format(FileFormat.PARQUET)
+                .build();
+        FanoutPositionOnlyDeleteWriter<Record> writer = new FanoutPositionOnlyDeleteWriter<>(
+                new TestPosDeleteWriterFactory(table, FileFormat.PARQUET),
+                fileFactory, table.io(), 64L * 1024 * 1024,
+                org.apache.iceberg.deletes.DeleteGranularity.PARTITION);
+        org.apache.iceberg.deletes.PositionDelete<Record> positionDelete =
+                org.apache.iceberg.deletes.PositionDelete.create();
+        try {
+            for (PosDeletePos p : positions) {
+                positionDelete.set(p.dataFilePath(), p.pos(), null);
+                writer.write(positionDelete, table.spec(), null);
+            }
+        } finally {
+            writer.close();
+        }
+        DeleteFile delete = Iterables.getOnlyElement(writer.result().deleteFiles());
+        table.newRowDelta().addDeletes(delete).commit();
+        return delete;
+    }
+
+    private record PosDeletePos(String dataFilePath, long pos) {}
+
+    private void indexAndCommitDataFiles(Table table, List<DataFile> dataFiles) {
+        org.apache.iceberg.AppendFiles append = table.newAppend();
+        dataFiles.forEach(append::appendFile);
+        append.commit();
+        DataFileRun run = new DataFileRun(1L, dataFiles, Map.of());
+        new DataFileIndexer(spark, index).index(TABLE_ID, table, run, IcestreamTableConfig.from(table));
+    }
+
+    /** Local FileWriterFactory adapter — matches WritePosDeleteFiles' inner class but lives in tests. */
+    private static final class TestPosDeleteWriterFactory implements org.apache.iceberg.io.FileWriterFactory<Record> {
+        private final Table table;
+        private final FileFormat deleteFormat;
+        private final Map<Integer, GenericAppenderFactory> bySpec = new HashMap<>();
+
+        TestPosDeleteWriterFactory(Table table, FileFormat deleteFormat) {
+            this.table = table;
+            this.deleteFormat = deleteFormat;
+        }
+
+        @Override
+        public org.apache.iceberg.deletes.PositionDeleteWriter<Record> newPositionDeleteWriter(
+                org.apache.iceberg.encryption.EncryptedOutputFile file,
+                PartitionSpec spec, StructLike partition) {
+            GenericAppenderFactory delegate = bySpec.computeIfAbsent(
+                    spec.specId(),
+                    id -> new GenericAppenderFactory(
+                            table, table.schema(), spec, table.properties(), null, null, null));
+            return delegate.newPosDeleteWriter(file, deleteFormat, partition);
+        }
+
+        @Override
+        public DataWriter<Record> newDataWriter(
+                org.apache.iceberg.encryption.EncryptedOutputFile file,
+                PartitionSpec spec, StructLike partition) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public EqualityDeleteWriter<Record> newEqualityDeleteWriter(
+                org.apache.iceberg.encryption.EncryptedOutputFile file,
+                PartitionSpec spec, StructLike partition) {
+            throw new UnsupportedOperationException();
+        }
     }
 }

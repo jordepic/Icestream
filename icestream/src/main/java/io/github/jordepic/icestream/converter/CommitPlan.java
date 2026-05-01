@@ -14,10 +14,10 @@ import org.apache.iceberg.DeleteFile;
 public record CommitPlan(
         long startingSnapshotId,
         List<DeleteFile> eqDeletesToRemove,
-        List<DeleteFile> existingDvsToRemove,
-        List<DeleteFile> newDvsToAdd) {
+        List<DeleteFile> existingDeletesToRemove,
+        List<DeleteFile> deletesToAdd) {
 
     public boolean isNoOp() {
-        return eqDeletesToRemove.isEmpty() && existingDvsToRemove.isEmpty() && newDvsToAdd.isEmpty();
+        return eqDeletesToRemove.isEmpty() && existingDeletesToRemove.isEmpty() && deletesToAdd.isEmpty();
     }
 }

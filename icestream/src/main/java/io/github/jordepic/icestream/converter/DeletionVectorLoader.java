@@ -30,7 +30,7 @@ public final class DeletionVectorLoader {
 
     private DeletionVectorLoader() {}
 
-    public record CollectedDvs(Map<String, DeleteFile> deletes, Map<String, DvInfo> serializableDeletes) {}
+    public record CollectedDvs(Map<String, DeleteFile> deletesByDataFilePath, Map<String, DvInfo> serializableDeletesByDataFilePath) {}
 
     public static CollectedDvs collect(Table table, Set<PartitionKey> touchedPartitions) {
         Map<String, DeleteFile> originals = new HashMap<>();

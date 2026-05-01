@@ -14,16 +14,17 @@ import io.github.jordepic.icestream.schema.IcestreamTableConfig;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SerializableTable;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.CharSequenceSet;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
@@ -34,9 +35,10 @@ import scala.Tuple2;
 
 /**
  * Pure planner: computes a {@link CommitPlan} that converts an {@link EqualityDeleteFileRun}'s
- * eq-delete files into puffin DVs by joining their pk values against the Cassandra index.
+ * eq-delete files into per-data-file scoped delete files (puffin DVs for V3, parquet/avro/orc
+ * pos-delete files for V2) by joining their pk values against the Cassandra index.
  *
- * <p>Pipeline (executor side: {@link EqDeleteReader} → {@link WriteDvs}):
+ * <p>Pipeline (executor side: {@link EqDeleteReader} → {@link DeleteFileStrategy}):
  * <pre>
  *   parallelize(eq-delete work items)
  *     flatMap(read eq-delete file via BaseDeleteLoader, encode pk + partition)
@@ -44,15 +46,16 @@ import scala.Tuple2;
  *     joinWithCassandraTable(on the four-column lookup key)
  *     mapToPair(data_file_path → (pos, specId, partitionBytes))
  *     groupByKey
- *     mapPartitions(write puffin DV per data file via BaseDVFileWriter)
+ *     mapPartitions(strategy.writer)   // emits TaskOutputs (new + rewritten delete files)
  * </pre>
  *
- * <p>{@link WriteDvs} passes the real {@code (specId, partition)} to {@code BaseDVFileWriter.delete}
- * (decoded from the avro bytes that traveled through the pipeline) so each emitted {@code
- * DeleteFile} already carries the correct partition tuple — the driver does not need to rebuild.
- *
- * <p>Existing DVs are pre-collected with a partition prune: only DVs whose {@code (specId,
- * partition)} matches a touched partition in this run are loaded.
+ * <p>Format-version is read once at the top of {@code create()} and pins the strategy for this
+ * run. A mid-run upgrade (V2 → V3) lands a delete file the committer rejects and the master loop
+ * replans. Existing per-data-file scoped delete files are tracked by the writer
+ * (BaseDVFileWriter for V3, SortingPositionOnlyDeleteWriter for V2) and surfaced as
+ * {@code TaskOutputs.rewrittenDeletes()} — no driver-side re-derivation needed. Unscoped /
+ * partition-granularity pos-delete files (V2 only, rare in streaming pipelines) are left
+ * alongside our output and merged by readers.
  *
  * <p>No internal retry. {@code ValidationException} from {@link ConversionCommitter} propagates;
  * the master loop re-plans against the new snapshot.
@@ -77,28 +80,41 @@ public final class DeleteFileCreator {
         if (run.files().isEmpty()) {
             return new CommitPlan(startingSnapshotId, List.of(), List.of(), List.of());
         }
+        DeleteFileStrategy strategy = pickStrategy(table);
         List<EqDeleteWorkItem> workItems = buildEqDeleteWorkItems(table, run);
         Set<PartitionKey> touchedPartitions = workItems.stream()
                 .map(item -> new PartitionKey(item.specId(), item.partitionBytes()))
                 .collect(Collectors.toSet());
-        DeletionVectorLoader.CollectedDvs existingDvs = DeletionVectorLoader.collect(table, touchedPartitions);
 
         JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
         Broadcast<Table> tableBroadcast = jsc.broadcast(SerializableTable.copyOf(table));
-        Broadcast<Map<String, DvInfo>> dvInfoBroadcast = jsc.broadcast(existingDvs.serializableDeletes());
 
-        List<DeleteFile> newDvs =
-                buildDvWritePipeline(id, workItems, config, tableBroadcast, dvInfoBroadcast).collect();
+        JavaPairRDD<String, PerPositionMatch> byDataFile =
+                buildJoinPipeline(id, workItems, config, tableBroadcast);
 
-        return assemblePlan(startingSnapshotId, run, existingDvs.deletes(), newDvs);
+        List<TaskOutputs> taskOutputs = strategy.writePerDataFileDeletes(
+                        jsc, tableBroadcast, table, touchedPartitions, byDataFile)
+                .collect();
+
+        return assemblePlan(startingSnapshotId, run, taskOutputs);
     }
 
-    JavaRDD<DeleteFile> buildDvWritePipeline(
+    private static DeleteFileStrategy pickStrategy(Table table) {
+        int formatVersion =
+                ((HasTableOperations) table).operations().current().formatVersion();
+        return switch (formatVersion) {
+            case 2 -> new PosDeleteFileStrategy();
+            case 3 -> new DvFileStrategy();
+            default -> throw new IllegalArgumentException(
+                    "icestream only supports v2 and v3 tables; got format-version=" + formatVersion);
+        };
+    }
+
+    JavaPairRDD<String, PerPositionMatch> buildJoinPipeline(
             TableIdentifier id,
             List<EqDeleteWorkItem> workItems,
             IcestreamTableConfig config,
-            Broadcast<Table> tableBroadcast,
-            Broadcast<Map<String, DvInfo>> dvInfoBroadcast) {
+            Broadcast<Table> tableBroadcast) {
         Schema pkSchema = new Schema(config.primaryKey().fields());
         Types.StructType pkStruct = Types.StructType.of(config.primaryKey().fields());
         JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
@@ -124,13 +140,11 @@ public final class DeleteFileCreator {
                                 mapRowTo(JoinedFileLocation.class),
                                 mapToRow(SerializableEqualityDelete.class));
 
-        JavaPairRDD<String, PerPositionMatch> byDataFile = joined.mapToPair(
+        return joined.mapToPair(
                 (PairFunction<Tuple2<SerializableEqualityDelete, JoinedFileLocation>, String, PerPositionMatch>)
                         t -> new Tuple2<>(
                                 t._2.getDataFilePath(),
                                 new PerPositionMatch(t._2.getPos(), t._1.getSpecId(), t._1.getPartitionKey())));
-
-        return byDataFile.groupByKey().mapPartitions(new WriteDvs(tableBroadcast, dvInfoBroadcast));
     }
 
     private List<EqDeleteWorkItem> buildEqDeleteWorkItems(Table table, EqualityDeleteFileRun run) {
@@ -144,19 +158,18 @@ public final class DeleteFileCreator {
     }
 
     private CommitPlan assemblePlan(
-            long startingSnapshotId,
-            EqualityDeleteFileRun run,
-            Map<String, DeleteFile> existingDvsByDataFile,
-            List<DeleteFile> newDvs) {
-        Set<String> seen = new HashSet<>();
-        List<DeleteFile> existingToRemove = new ArrayList<>();
-        for (DeleteFile newDv : newDvs) {
-            String referenced = newDv.referencedDataFile().toString();
-            DeleteFile existing = existingDvsByDataFile.get(referenced);
-            if (existing != null && seen.add(referenced)) {
-                existingToRemove.add(existing);
+            long startingSnapshotId, EqualityDeleteFileRun run, List<TaskOutputs> taskOutputs) {
+        List<DeleteFile> newDeletes = new ArrayList<>();
+        List<DeleteFile> rewrittenDeletes = new ArrayList<>();
+        CharSequenceSet seenRewrittenLocations = CharSequenceSet.empty();
+        for (TaskOutputs output : taskOutputs) {
+            newDeletes.addAll(output.newDeletes());
+            for (DeleteFile rewritten : output.rewrittenDeletes()) {
+                if (seenRewrittenLocations.add(rewritten.location())) {
+                    rewrittenDeletes.add(rewritten);
+                }
             }
         }
-        return new CommitPlan(startingSnapshotId, new ArrayList<>(run.files()), existingToRemove, newDvs);
+        return new CommitPlan(startingSnapshotId, new ArrayList<>(run.files()), rewrittenDeletes, newDeletes);
     }
 }

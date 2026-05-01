@@ -85,6 +85,23 @@ class ConversionCommitterTest {
     }
 
     @Test
+    void commit_setsIcestreamConvertedSummary() throws IOException {
+        DataFile dataFile = writeDataFile(List.of(record(1L, "a")));
+        DeleteFile eqDelete = writeEqDelete(List.of(record(1L, null)));
+        table.newAppend().appendFile(dataFile).commit();
+        table.newRowDelta().addDeletes(eqDelete).commit();
+        long planSnapshot = table.currentSnapshot().snapshotId();
+        DeleteFile newDv = writeDvOutOfBand(dataFile, List.of(0L));
+
+        ConversionCommitter.commit(
+                table, new CommitPlan(planSnapshot, List.of(eqDelete), List.of(), List.of(newDv)));
+
+        table.refresh();
+        assertThat(table.currentSnapshot().summary())
+                .containsEntry(ConversionCommitter.ICESTREAM_CONVERTED_SUMMARY_KEY, "true");
+    }
+
+    @Test
     void commit_removesExistingDvAndAddsMergedDv() throws IOException {
         DataFile dataFile = writeDataFile(List.of(record(1L, "a"), record(2L, "b"), record(3L, "c")));
         table.newAppend().appendFile(dataFile).commit();

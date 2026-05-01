@@ -30,6 +30,8 @@ import org.apache.iceberg.Table;
  */
 public final class ConversionCommitter {
 
+    public static final String ICESTREAM_CONVERTED_SUMMARY_KEY = "icestream-converted";
+
     private ConversionCommitter() {}
 
     public static void commit(Table table, CommitPlan plan) {
@@ -38,10 +40,11 @@ public final class ConversionCommitter {
         }
         RowDelta rowDelta = table.newRowDelta()
                 .validateFromSnapshot(plan.startingSnapshotId())
-                .validateDeletedFiles();
-        plan.newDvsToAdd().forEach(rowDelta::addDeletes);
+                .validateDeletedFiles()
+                .set(ICESTREAM_CONVERTED_SUMMARY_KEY, "true");
+        plan.deletesToAdd().forEach(rowDelta::addDeletes);
         plan.eqDeletesToRemove().forEach(rowDelta::removeDeletes);
-        plan.existingDvsToRemove().forEach(rowDelta::removeDeletes);
+        plan.existingDeletesToRemove().forEach(rowDelta::removeDeletes);
         rowDelta.commit();
     }
 }
