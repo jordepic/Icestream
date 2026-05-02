@@ -112,7 +112,8 @@ class TableProcessorTest {
                 new SnapshotPlanner(),
                 new DataFileIndexer(spark, index),
                 new DeleteFileCreator(spark, index),
-                index);
+                index,
+                IcestreamMetrics.NOOP);
     }
 
     @AfterEach

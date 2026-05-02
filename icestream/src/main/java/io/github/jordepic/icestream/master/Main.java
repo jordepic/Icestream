@@ -37,7 +37,8 @@ public final class Main {
                 new SnapshotPlanner(),
                 new DataFileIndexer(spark, cassandra),
                 new DeleteFileCreator(spark, cassandra),
-                cassandra);
+                cassandra,
+                IcestreamMetrics.NOOP);
         MasterLoop loop = new MasterLoop(
                 catalog, processor, config.pollInterval(), config.idleBackoff(), config.maxConcurrentTasks());
 

@@ -4,10 +4,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.datastax.oss.driver.api.core.CqlSession;
 import io.github.jordepic.icestream.cassandra.CassandraIndex;
+import io.github.jordepic.icestream.converter.ConversionCommitter;
 import io.github.jordepic.icestream.converter.DeleteFileCreator;
 import io.github.jordepic.icestream.indexer.DataFileIndexer;
+import io.github.jordepic.icestream.master.IcestreamMetrics;
 import io.github.jordepic.icestream.master.MasterLoop;
 import io.github.jordepic.icestream.master.TableProcessor;
+import io.github.jordepic.icestream.planner.FileKind;
 import io.github.jordepic.icestream.planner.SnapshotPlanner;
 import io.github.jordepic.icestream.schema.IcestreamProperties;
 import java.io.IOException;
@@ -20,16 +23,24 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.List;
+import java.util.LongSummaryStatistics;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.DataOperations;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.data.IcebergGenerics;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.rest.RESTCatalog;
@@ -91,6 +102,7 @@ class IcestreamEndToEndIT {
     private static ConfluentKafkaContainer kafka;
     private static GenericContainer<?> flinkJobManager;
     private static GenericContainer<?> flinkTaskManager;
+    private static GenericContainer<?> sparkCompaction;
     private static Path flinkLibDir;
 
     @BeforeAll
@@ -171,6 +183,9 @@ class IcestreamEndToEndIT {
 
     @AfterAll
     static void stopStack() {
+        if (sparkCompaction != null) {
+            sparkCompaction.stop();
+        }
         if (flinkTaskManager != null) {
             flinkTaskManager.stop();
         }
@@ -208,6 +223,7 @@ class IcestreamEndToEndIT {
         System.out.println("\n==== REST catalog logs ====\n" + safeLogs(rest));
         System.out.println("\n==== Flink JM logs ====\n" + safeLogs(flinkJobManager));
         System.out.println("\n==== Flink TM logs ====\n" + safeLogs(flinkTaskManager));
+        System.out.println("\n==== Spark compaction logs ====\n" + safeLogs(sparkCompaction));
     }
 
     private static String safeLogs(GenericContainer<?> c) {
@@ -228,6 +244,7 @@ class IcestreamEndToEndIT {
             createKafkaTopic();
             submitFlinkJob();
             waitForFlinkJobRunning();
+            startSparkCompaction();
 
             try (CqlSession cql = newCqlSession();
                     SparkSession spark = newSparkSession()) {
@@ -244,7 +261,8 @@ class IcestreamEndToEndIT {
                 producerThread.setDaemon(true);
                 producerThread.start();
 
-                MasterLoop loop = newMasterLoop(spark, cql, catalog);
+                RecordingMetrics metrics = new RecordingMetrics();
+                MasterLoop loop = newMasterLoop(spark, cql, catalog, metrics);
                 Thread loopThread = new Thread(loop::run, "icestream-it-master");
                 loopThread.setDaemon(true);
                 loopThread.start();
@@ -255,22 +273,160 @@ class IcestreamEndToEndIT {
                 producerThread.join(Duration.ofSeconds(5).toMillis());
                 loop.stop();
                 loopThread.join(Duration.ofSeconds(10).toMillis());
+
+                logIcestreamRunMetrics(metrics);
+                assertThat(metrics.records())
+                        .as("icestream master should have attempted at least one run")
+                        .isNotEmpty();
             }
+
+            assertThat(sparkCompaction.getLogs())
+                    .as("spark compaction loop must have completed at least one rewrite")
+                    .contains("compaction iteration succeeded");
+            sparkCompaction.stop();
 
             waitForFlinkFinalCheckpoint(catalog);
 
             Table table = catalog.loadTable(TABLE_ID);
-            long totalSnapshots = countSnapshots(table);
-            long icestreamSnapshots = StreamSupport.stream(table.snapshots().spliterator(), false)
-                    .filter(s -> "true".equals(s.summary().get("icestream-converted")))
-                    .count();
-
-            assertThat(totalSnapshots).as("flink should have committed at least once").isGreaterThan(0);
-            assertThat(icestreamSnapshots)
-                    .as("icestream should have converted at least one eq-delete batch")
-                    .isGreaterThan(0);
+            assertThat(countSnapshots(table)).as("flink should have committed at least once").isGreaterThan(0);
+            assertIcestreamSnapshotsAreNoOps(table);
         }
     }
+
+    private static void logIcestreamRunMetrics(RecordingMetrics metrics) {
+        List<RecordingMetrics.Record> records = metrics.records();
+        long successes = records.stream().filter(RecordingMetrics.Record::isSuccess).count();
+        long failures = records.size() - successes;
+        LongSummaryStatistics overall = records.stream()
+                .mapToLong(r -> r.elapsed().toMillis())
+                .summaryStatistics();
+        log.info(
+                "Icestream run metrics: total={} successes={} failures={} latencyMs(min/avg/max)={}/{}/{}",
+                records.size(),
+                successes,
+                failures,
+                overall.getCount() == 0 ? 0 : overall.getMin(),
+                overall.getCount() == 0 ? 0 : (long) overall.getAverage(),
+                overall.getCount() == 0 ? 0 : overall.getMax());
+        for (FileKind kind : FileKind.values()) {
+            List<RecordingMetrics.Record> ofKind = records.stream()
+                    .filter(r -> r.kind() == kind)
+                    .toList();
+            LongSummaryStatistics latency = ofKind.stream()
+                    .mapToLong(r -> r.elapsed().toMillis())
+                    .summaryStatistics();
+            long kindSuccesses = ofKind.stream().filter(RecordingMetrics.Record::isSuccess).count();
+            log.info(
+                    "  kind={} count={} successes={} failures={} avgFileCount={} avgMs={}",
+                    kind,
+                    ofKind.size(),
+                    kindSuccesses,
+                    ofKind.size() - kindSuccesses,
+                    ofKind.isEmpty()
+                            ? 0
+                            : (long) ofKind.stream().mapToInt(RecordingMetrics.Record::fileCount).average().orElse(0),
+                    latency.getCount() == 0 ? 0 : (long) latency.getAverage());
+        }
+    }
+
+    private static void startSparkCompaction() {
+        sparkCompaction = new GenericContainer<>(DockerImageName.parse("tabulario/spark-iceberg:latest"))
+                .withNetwork(network)
+                .withNetworkAliases("spark-compaction")
+                .withCopyFileToContainer(
+                        MountableFile.forClasspathResource("compaction_loop.py"), "/scripts/compaction_loop.py")
+                .withEnv("AWS_ACCESS_KEY_ID", AWS_ACCESS_KEY)
+                .withEnv("AWS_SECRET_ACCESS_KEY", AWS_SECRET_KEY)
+                .withEnv("AWS_REGION", "us-east-1")
+                .withCreateContainerCmdModifier(cmd -> cmd.withEntrypoint("/bin/bash"))
+                .withCommand(
+                        "-c",
+                        String.join(
+                                " ",
+                                "spark-submit",
+                                "--conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+                                "--conf spark.sql.defaultCatalog=iceberg",
+                                "--conf spark.sql.catalog.iceberg=org.apache.iceberg.spark.SparkCatalog",
+                                "--conf spark.sql.catalog.iceberg.catalog-impl=org.apache.iceberg.rest.RESTCatalog",
+                                "--conf spark.sql.catalog.iceberg.uri=http://rest:8181",
+                                "--conf spark.sql.catalog.iceberg.warehouse=s3://" + S3_BUCKET + "/",
+                                "--conf spark.sql.catalog.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO",
+                                "--conf spark.sql.catalog.iceberg.s3.endpoint=http://minio:9000",
+                                "--conf spark.sql.catalog.iceberg.s3.path-style-access=true",
+                                "--conf spark.sql.catalog.iceberg.s3.access-key-id=" + AWS_ACCESS_KEY,
+                                "--conf spark.sql.catalog.iceberg.s3.secret-access-key=" + AWS_SECRET_KEY,
+                                "--conf spark.sql.catalog.iceberg.client.region=us-east-1",
+                                "--conf spark.sql.catalog.iceberg.cache-enabled=false",
+                                "/scripts/compaction_loop.py"))
+                .withStartupTimeout(Duration.ofMinutes(5))
+                .waitingFor(Wait.forLogMessage(".*compaction loop starting.*", 1))
+                .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("spark-compaction"));
+        sparkCompaction.start();
+    }
+
+    private static void assertIcestreamSnapshotsAreNoOps(Table table) throws IOException {
+        Map<Long, Snapshot> snapshotsById = StreamSupport.stream(table.snapshots().spliterator(), false)
+                .collect(Collectors.toMap(Snapshot::snapshotId, s -> s));
+
+        Set<Long> icestreamSnapshots = snapshotsById.values().stream()
+                .filter(s -> "true".equals(s.summary().get(ConversionCommitter.ICESTREAM_CONVERTED_SUMMARY_KEY)))
+                .map(Snapshot::snapshotId)
+                .collect(Collectors.toSet());
+
+        long sparkRewriteSnapshots = snapshotsById.values().stream()
+                .filter(s -> DataOperations.REPLACE.equals(s.operation()))
+                .count();
+
+        long icestreamSnapshotsAfterRewrite = icestreamSnapshots.stream()
+                .map(snapshotsById::get)
+                .filter(s -> s.parentId() != null
+                        && DataOperations.REPLACE.equals(snapshotsById.get(s.parentId()).operation()))
+                .count();
+
+        log.info(
+                "Snapshot stats: total={} icestream={} sparkRewrite={} icestreamAfterRewrite={}",
+                snapshotsById.size(),
+                icestreamSnapshots.size(),
+                sparkRewriteSnapshots,
+                icestreamSnapshotsAfterRewrite);
+
+        assertThat(icestreamSnapshots)
+                .as("icestream should have converted at least one eq-delete batch")
+                .isNotEmpty();
+        assertThat(sparkRewriteSnapshots)
+                .as("spark rewrite_data_files should have produced replace snapshots")
+                .isGreaterThan(0);
+        assertThat(icestreamSnapshotsAfterRewrite)
+                .as("icestream should have committed after at least one spark rewrite")
+                .isGreaterThan(0);
+
+        for (long snapshotId : icestreamSnapshots) {
+            Snapshot snapshot = snapshotsById.get(snapshotId);
+            Long parentId = snapshot.parentId();
+            assertThat(parentId)
+                    .as("icestream snapshot %d unexpectedly has no parent", snapshotId)
+                    .isNotNull();
+            Set<RowKey> child = readRowSet(table, snapshotId);
+            Set<RowKey> parent = readRowSet(table, parentId);
+            assertThat(child)
+                    .as("icestream snapshot %d changed visible rows vs parent %d", snapshotId, parentId)
+                    .isEqualTo(parent);
+        }
+    }
+
+    private static Set<RowKey> readRowSet(Table table, long snapshotId) throws IOException {
+        try (CloseableIterable<Record> iter = IcebergGenerics.read(table)
+                .useSnapshot(snapshotId)
+                .select("id", "name", "ts")
+                .build()) {
+            return StreamSupport.stream(iter.spliterator(), false)
+                    .map(r -> new RowKey(
+                            (Long) r.getField("id"), (String) r.getField("name"), (Long) r.getField("ts")))
+                    .collect(Collectors.toSet());
+        }
+    }
+
+    private record RowKey(long id, String name, long ts) {}
 
     private static void createKafkaTopic() throws Exception {
         Map<String, Object> props = new HashMap<>();
@@ -347,14 +503,43 @@ class IcestreamEndToEndIT {
         return StreamSupport.stream(table.snapshots().spliterator(), false).count();
     }
 
-    private MasterLoop newMasterLoop(SparkSession spark, CqlSession cql, RESTCatalog catalog) {
+    private MasterLoop newMasterLoop(
+            SparkSession spark, CqlSession cql, RESTCatalog catalog, IcestreamMetrics metrics) {
         CassandraIndex cassandraIndex = new CassandraIndex(cql, CASSANDRA_KEYSPACE);
         TableProcessor processor = new TableProcessor(
                 new SnapshotPlanner(),
                 new DataFileIndexer(spark, cassandraIndex),
                 new DeleteFileCreator(spark, cassandraIndex),
-                cassandraIndex);
+                cassandraIndex,
+                metrics);
         return new MasterLoop(catalog, processor, ICESTREAM_POLL, ICESTREAM_IDLE_BACKOFF, 2);
+    }
+
+    private static final class RecordingMetrics implements IcestreamMetrics {
+
+        private final List<Record> records = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void recordRunSuccess(TableIdentifier table, FileKind kind, int fileCount, Duration elapsed) {
+            records.add(new Record(table, kind, fileCount, elapsed, null));
+        }
+
+        @Override
+        public void recordRunFailure(
+                TableIdentifier table, FileKind kind, int fileCount, Duration elapsed, Throwable cause) {
+            records.add(new Record(table, kind, fileCount, elapsed, cause));
+        }
+
+        List<Record> records() {
+            return List.copyOf(records);
+        }
+
+        record Record(TableIdentifier table, FileKind kind, int fileCount, Duration elapsed, Throwable failure) {
+
+            boolean isSuccess() {
+                return failure == null;
+            }
+        }
     }
 
     private static SparkSession newSparkSession() {
