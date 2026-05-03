@@ -8,12 +8,10 @@ import io.github.jordepic.icestream.planner.SnapshotPlanner;
 import java.io.Closeable;
 import java.net.InetSocketAddress;
 import java.time.Duration;
-import java.util.Map;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.iceberg.CatalogProperties;
-import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.spark.SparkCatalog;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.catalog.CatalogPlugin;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,10 +25,11 @@ public final class Main {
         Config config = Config.fromEnv();
         log.info("Starting icestream master with {}", config);
 
-        SparkSession spark = buildSpark(config);
+        SparkSession spark = SparkSession.builder().appName("icestream-master").getOrCreate();
+        Catalog catalog = extractIcebergCatalog(spark, config.catalogName());
+
         CqlSession cql = buildCqlSession(config);
         ensureKeyspace(cql, config.keyspace());
-        Catalog catalog = buildCatalog(config);
 
         CassandraIndex cassandra = new CassandraIndex(cql, config.keyspace());
         TableProcessor processor = new TableProcessor(
@@ -57,14 +56,15 @@ public final class Main {
         loop.run();
     }
 
-    private static SparkSession buildSpark(Config config) {
-        return SparkSession.builder()
-                .master(config.sparkMaster())
-                .appName("icestream-master")
-                .config("spark.cassandra.connection.host", config.cassandraHost())
-                .config("spark.cassandra.connection.port", String.valueOf(config.cassandraPort()))
-                .config("spark.cassandra.connection.localDC", config.cassandraLocalDc())
-                .getOrCreate();
+    private static Catalog extractIcebergCatalog(SparkSession spark, String catalogName) {
+        CatalogPlugin plugin = spark.sessionState().catalogManager().catalog(catalogName);
+        if (!(plugin instanceof SparkCatalog sparkCatalog)) {
+            throw new IllegalStateException(
+                    "Spark catalog '" + catalogName + "' is not an Iceberg SparkCatalog: "
+                            + plugin.getClass().getName()
+                            + ". Configure it via spark.sql.catalog." + catalogName + ".*");
+        }
+        return sparkCatalog.icebergCatalog();
     }
 
     private static CqlSession buildCqlSession(Config config) {
@@ -77,14 +77,6 @@ public final class Main {
     private static void ensureKeyspace(CqlSession cql, String keyspace) {
         cql.execute("CREATE KEYSPACE IF NOT EXISTS " + keyspace
                 + " WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
-    }
-
-    private static Catalog buildCatalog(Config config) {
-        Map<String, String> props = Map.of(
-                CatalogProperties.URI, config.catalogUri(),
-                CatalogProperties.WAREHOUSE_LOCATION, config.warehouse());
-        return CatalogUtil.loadCatalog(
-                "org.apache.iceberg.rest.RESTCatalog", "icestream", props, new Configuration());
     }
 
     private static void closeQuietly(ThrowingRunnable closer, String label) {
@@ -102,26 +94,22 @@ public final class Main {
     }
 
     record Config(
-            String catalogUri,
-            String warehouse,
+            String catalogName,
             String cassandraHost,
             int cassandraPort,
             String cassandraLocalDc,
             String keyspace,
-            String sparkMaster,
             Duration pollInterval,
             Duration idleBackoff,
             int maxConcurrentTasks) {
 
         static Config fromEnv() {
             return new Config(
-                    requireEnv("ICESTREAM_CATALOG_URI"),
-                    requireEnv("ICESTREAM_WAREHOUSE"),
+                    envOrDefault("ICESTREAM_CATALOG_NAME", "iceberg"),
                     requireEnv("ICESTREAM_CASSANDRA_HOST"),
                     Integer.parseInt(envOrDefault("ICESTREAM_CASSANDRA_PORT", "9042")),
                     requireEnv("ICESTREAM_CASSANDRA_LOCAL_DC"),
                     envOrDefault("ICESTREAM_KEYSPACE", "icestream"),
-                    envOrDefault("ICESTREAM_SPARK_MASTER", "local[*]"),
                     Duration.ofSeconds(Long.parseLong(envOrDefault("ICESTREAM_POLL_INTERVAL_SECONDS", "10"))),
                     Duration.ofSeconds(Long.parseLong(envOrDefault("ICESTREAM_IDLE_BACKOFF_SECONDS", "60"))),
                     Integer.parseInt(envOrDefault("ICESTREAM_MAX_CONCURRENT_TASKS", "4")));

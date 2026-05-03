@@ -1,0 +1,6 @@
+apiVersion: v2
+name: icestream
+description: icestream master — async eq-delete to deletion-vector indexer for Iceberg, running as a long-lived Spark driver pod.
+type: application
+version: 1.0.0
+appVersion: "1.0-SNAPSHOT"

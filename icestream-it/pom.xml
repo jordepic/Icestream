@@ -65,6 +65,21 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- Spark is `provided` in icestream (lives in the apache/spark base image) so it
+             does not transit; declare it explicitly for the IT JVM. -->
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-core_${spark.scala.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-sql_${spark.scala.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>test</scope>
+        </dependency>
+
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>kafka-clients</artifactId>

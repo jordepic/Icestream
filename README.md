@@ -243,18 +243,18 @@ These are deliberate v1 simplifications, not permanent constraints.
 
 ### Master process (environment variables)
 
-Read once at startup by `Main.Config.fromEnv()`. Connection settings are
-required; scheduling knobs default to values that suit a small deployment.
+Read once at startup by `Main.Config.fromEnv()`. The Iceberg catalog is **not**
+configured here — `Main` resolves it out of the SparkSession via
+`spark.sql.catalog.<ICESTREAM_CATALOG_NAME>.*` (Spark properties), so the same
+catalog config drives both the master loop and any DataFrame I/O.
 
 | Variable                          | Required | Default     | Meaning                                                   |
 |-----------------------------------|----------|-------------|-----------------------------------------------------------|
-| `ICESTREAM_CATALOG_URI`           | yes      | —           | Iceberg REST catalog URI.                                 |
-| `ICESTREAM_WAREHOUSE`             | yes      | —           | Warehouse location passed to the catalog.                 |
+| `ICESTREAM_CATALOG_NAME`          | no       | `iceberg`   | Spark catalog name to extract via `SparkCatalog`.         |
 | `ICESTREAM_CASSANDRA_HOST`        | yes      | —           | Cassandra contact point.                                  |
 | `ICESTREAM_CASSANDRA_PORT`        | no       | `9042`      | Cassandra native port.                                    |
 | `ICESTREAM_CASSANDRA_LOCAL_DC`    | yes      | —           | Local DC for `LOCAL_QUORUM` and the Spark connector.      |
 | `ICESTREAM_KEYSPACE`              | no       | `icestream` | Keyspace that holds per-table index tables.               |
-| `ICESTREAM_SPARK_MASTER`          | no       | `local[*]`  | Spark master URL.                                         |
 | `ICESTREAM_POLL_INTERVAL_SECONDS` | no       | `10`        | Sleep between polling sweeps that enqueue ready tables.   |
 | `ICESTREAM_IDLE_BACKOFF_SECONDS`  | no       | `60`        | Cooldown before re-polling a table that had no work.      |
 | `ICESTREAM_MAX_CONCURRENT_TASKS`  | no       | `4`         | Worker pool size — tables processed in parallel per tick. |
@@ -271,3 +271,56 @@ required; scheduling knobs default to values that suit a small deployment.
 The pinned-* properties exist so the planner can detect a configuration change
 between watermark commits and fail-loud rather than silently corrupting the
 index.
+
+## Container & Helm chart
+
+The master ships as a single Jib-built image that runs `spark-submit` in client
+mode at pod start, so the pod itself is the long-lived Spark driver. Executors
+are dynamic, scheduled by Spark's k8s backend onto the same cluster.
+
+### Image
+
+`apache/spark:3.5.4-java17` is the Jib `<from>`. The build adds two layers:
+the app jar at `/app/icestream-<version>.jar` and the runtime extras
+(`iceberg-spark-runtime`, `spark-cassandra-connector` + driver, our remaining
+deps) under `/opt/spark/jars/`. Spark itself, Scala, Hadoop, and Jackson come
+from the base image — those are `provided` in `icestream/pom.xml` so they
+aren't double-shipped.
+
+```
+mvn -pl icestream package jib:dockerBuild   # local Docker daemon
+mvn -pl icestream package jib:build         # push to image.repository
+```
+
+`iceberg-spark-runtime-3.5_2.12` is the only compile-scope iceberg dep — it
+gives `Main` access to `SparkCatalog` at compile time and ships to
+`/opt/spark/jars/` via `copy-dependencies`. The smaller `iceberg-*` modules
+(`iceberg-core`, `iceberg-api`, etc.) are `provided`, since the runtime fat
+jar already bundles them inside.
+
+### Helm chart
+
+`helm/` is a small single-StatefulSet chart. Driver pod resources, dynamic
+allocation bounds, the catalog block, the Cassandra block, and arbitrary
+Spark conf overrides all live in `values.yaml`. Two ConfigMaps drive the
+runtime: `spark-properties.conf` (master URL, catalog, dynamic allocation,
+Cassandra connector) and `executor-pod-template.yaml` (handed to Spark via
+`spark.kubernetes.executor.podTemplateFile`). RBAC grants the driver pod
+permission to create/delete executor pods. Pod-level dynamic values
+(`spark.driver.host`, `spark.driver.pod.name`) are passed through
+`--conf` overrides on the `spark-submit` line so we don't need a templating
+shell step inside the container.
+
+```
+helm install icestream ./helm \
+  --set image.repository=icestream/icestream-master \
+  --set image.tag=1.0-SNAPSHOT \
+  --set appConfig.catalog.uri=http://iceberg-rest:8181 \
+  --set appConfig.catalog.warehouse=s3://warehouse/ \
+  --set appConfig.cassandra.host=cassandra \
+  --set appConfig.cassandra.localDc=datacenter1
+```
+
+Per-namespace defaults: ServiceAccount + Role + RoleBinding are created and
+scoped to the release namespace. The ClusterIP Service exposes the Spark UI
+on port 4040 for in-cluster access.

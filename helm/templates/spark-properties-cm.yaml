@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "icestream.fullname" . }}-spark-properties
+  labels:
+    {{- include "icestream.labels" . | nindent 4 }}
+data:
+  spark-properties.conf: |
+    spark.master                                k8s://{{ .Values.spark.kubernetesEndpoint }}
+    spark.submit.deployMode                     client
+    spark.kubernetes.namespace                  {{ .Release.Namespace }}
+    spark.kubernetes.container.image            {{ include "icestream.image" . }}
+    spark.kubernetes.container.image.pullPolicy {{ .Values.image.pullPolicy }}
+    spark.kubernetes.authenticate.driver.serviceAccountName {{ include "icestream.serviceAccountName" . }}
+    spark.kubernetes.executor.podTemplateFile   /opt/spark/conf/executor-pod-template.yaml
+    spark.kubernetes.driver.label.app.kubernetes.io/name     {{ include "icestream.name" . }}
+    spark.kubernetes.driver.label.app.kubernetes.io/instance {{ .Release.Name }}
+    spark.kubernetes.executor.label.app.kubernetes.io/name     {{ include "icestream.name" . }}
+    spark.kubernetes.executor.label.app.kubernetes.io/instance {{ .Release.Name }}
+
+    spark.driver.cores                          {{ .Values.spark.driver.cores }}
+    spark.driver.memory                         {{ .Values.spark.driver.memoryMiB }}m
+    spark.driver.memoryOverheadFactor           {{ .Values.spark.driver.memoryOverheadFactor }}
+
+    spark.executor.cores                        {{ .Values.spark.executor.cores }}
+    spark.kubernetes.executor.request.cores     {{ printf "%dm" (int .Values.spark.executor.requestCoresMilliCPU) }}
+    spark.executor.memory                       {{ .Values.spark.executor.memoryMiB }}m
+    spark.executor.memoryOverheadFactor         {{ .Values.spark.executor.memoryOverheadFactor }}
+
+    spark.dynamicAllocation.enabled                 true
+    spark.dynamicAllocation.shuffleTracking.enabled true
+    spark.dynamicAllocation.minExecutors            {{ .Values.spark.executor.minExecutors }}
+    spark.dynamicAllocation.maxExecutors            {{ .Values.spark.executor.maxExecutors }}
+
+    spark.local.dir                             {{ .Values.spark.scratchDir }}
+
+    spark.sql.extensions                        org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+    spark.sql.catalog.{{ .Values.appConfig.catalog.name }}                                org.apache.iceberg.spark.SparkCatalog
+    spark.sql.catalog.{{ .Values.appConfig.catalog.name }}.type                           {{ .Values.appConfig.catalog.type }}
+    spark.sql.catalog.{{ .Values.appConfig.catalog.name }}.uri                            {{ .Values.appConfig.catalog.uri }}
+    spark.sql.catalog.{{ .Values.appConfig.catalog.name }}.warehouse                      {{ .Values.appConfig.catalog.warehouse }}
+    spark.sql.catalog.{{ .Values.appConfig.catalog.name }}.io-impl                        {{ .Values.appConfig.catalog.ioImpl }}
+    {{- range $k, $v := .Values.appConfig.catalog.extraProperties }}
+    spark.sql.catalog.{{ $.Values.appConfig.catalog.name }}.{{ $k }}                      {{ $v }}
+    {{- end }}
+
+    spark.cassandra.connection.host             {{ .Values.appConfig.cassandra.host }}
+    spark.cassandra.connection.port             {{ .Values.appConfig.cassandra.port }}
+    spark.cassandra.connection.localDC          {{ .Values.appConfig.cassandra.localDc }}
+
+    {{- range $k, $v := .Values.spark.additionalSparkConf }}
+    {{ $k }} {{ $v }}
+    {{- end }}

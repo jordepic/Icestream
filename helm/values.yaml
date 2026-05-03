@@ -1,0 +1,71 @@
+replicaCount: 1
+
+image:
+  repository: icestream/icestream-master
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# In-cluster endpoints, plain values (no Secret) per the v1 deployment story.
+appConfig:
+  catalog:
+    # Spark catalog name — Main reads `ICESTREAM_CATALOG_NAME` and resolves
+    # `spark.sql.catalog.<name>` from the Spark properties below.
+    name: iceberg
+    type: rest
+    uri: http://iceberg-rest:8181
+    warehouse: s3://warehouse/
+    ioImpl: org.apache.iceberg.aws.s3.S3FileIO
+    # Free-form additional `spark.sql.catalog.<name>.<key>` properties (S3
+    # endpoint, region, etc). Rendered verbatim into spark-properties.conf.
+    extraProperties: {}
+      # s3.endpoint: http://minio:9000
+      # s3.path-style-access: "true"
+      # client.region: us-east-1
+  cassandra:
+    host: cassandra
+    port: 9042
+    localDc: datacenter1
+  icestream:
+    keyspace: icestream
+    pollIntervalSeconds: 10
+    idleBackoffSeconds: 60
+    maxConcurrentTasks: 4
+
+spark:
+  # Free-form spark conf, merged into spark-properties.conf after the catalog
+  # and cassandra-connector blocks. Use this for things like
+  # `spark.sql.adaptive.enabled`, custom serializers, etc.
+  additionalSparkConf: {}
+  driver:
+    cores: 1
+    memoryMiB: 2048
+    memoryOverheadFactor: 0.1
+  executor:
+    cores: 1
+    requestCoresMilliCPU: 500
+    memoryMiB: 4096
+    memoryOverheadFactor: 0.1
+    minExecutors: 0
+    maxExecutors: 8
+  scratchDir: /tmp
+  kubernetesEndpoint: https://kubernetes.default.svc:443
+
+serviceAccount:
+  create: true
+  annotations: {}
+  automountServiceAccountToken: true
+
+service:
+  create: true
+  type: ClusterIP
+
+containerPorts:
+  sparkUi: 4040
+
+podAnnotations: {}
+podSecurityContext: {}
+extraEnv: []
