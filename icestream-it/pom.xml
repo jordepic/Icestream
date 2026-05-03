@@ -13,6 +13,7 @@
 
     <properties>
         <flink.lib.directory>${project.build.directory}/flink-lib</flink.lib.directory>
+        <spark.compaction.lib.directory>${project.build.directory}/spark-compaction-lib</spark.compaction.lib.directory>
     </properties>
 
     <dependencies>
@@ -183,6 +184,29 @@
                             </artifactItems>
                         </configuration>
                     </execution>
+                    <execution>
+                        <id>copy-spark-compaction-lib-jars</id>
+                        <phase>process-test-resources</phase>
+                        <goals>
+                            <goal>copy</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${spark.compaction.lib.directory}</outputDirectory>
+                            <stripVersion>false</stripVersion>
+                            <artifactItems>
+                                <artifactItem>
+                                    <groupId>org.apache.iceberg</groupId>
+                                    <artifactId>iceberg-spark-runtime-${spark.major.version}_${spark.scala.version}</artifactId>
+                                    <version>${iceberg.version}</version>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>org.apache.iceberg</groupId>
+                                    <artifactId>iceberg-aws-bundle</artifactId>
+                                    <version>${iceberg.version}</version>
+                                </artifactItem>
+                            </artifactItems>
+                        </configuration>
+                    </execution>
                 </executions>
             </plugin>
 
@@ -207,6 +231,7 @@
                     </argLine>
                     <systemPropertyVariables>
                         <icestream.it.flinkLibDir>${flink.lib.directory}</icestream.it.flinkLibDir>
+                        <icestream.it.sparkCompactionLibDir>${spark.compaction.lib.directory}</icestream.it.sparkCompactionLibDir>
                     </systemPropertyVariables>
                     <includes>
                         <include>**/*IT.java</include>

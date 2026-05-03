@@ -41,6 +41,16 @@
 
     <dependencyManagement>
         <dependencies>
+            <!-- Pin all jackson-* to the Spark 3.5.4-compatible 2.15.2 line.
+                 iceberg-aws BOM-imports jackson-bom 2.19.2 transitively, which collides
+                 with jackson-module-scala 2.15.2's setupModule version check. -->
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <dependency>
                 <groupId>org.apache.parquet</groupId>
                 <artifactId>parquet-column</artifactId>

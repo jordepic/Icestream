@@ -3,9 +3,7 @@ package io.github.jordepic.icestream.master;
 import io.github.jordepic.icestream.schema.IcestreamProperties;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -188,23 +186,25 @@ public final class MasterLoop {
 
     private List<Namespace> walkNamespaces() {
         if (!(catalog instanceof SupportsNamespaces sn)) {
-            return List.of(Namespace.empty());
+            return List.of();
         }
-        Deque<Namespace> stack = new ArrayDeque<>();
-        stack.push(Namespace.empty());
         List<Namespace> out = new ArrayList<>();
-        while (!stack.isEmpty()) {
-            Namespace cur = stack.pop();
-            out.add(cur);
-            try {
-                for (Namespace child : sn.listNamespaces(cur)) {
-                    stack.push(child);
-                }
-            } catch (Exception e) {
-                log.warn("Failed to list children of {}; skipping subtree", cur, e);
-            }
-        }
+        walkNamespaces(sn, Namespace.empty(), out);
         return out;
+    }
+
+    private void walkNamespaces(SupportsNamespaces sn, Namespace parent, List<Namespace> out) {
+        List<Namespace> children;
+        try {
+            children = sn.listNamespaces(parent);
+        } catch (Exception e) {
+            log.warn("Failed to list children of {}; skipping subtree", parent, e);
+            return;
+        }
+        for (Namespace child : children) {
+            out.add(child);
+            walkNamespaces(sn, child, out);
+        }
     }
 
     private static boolean sleepInterruptibly(Duration duration) {

@@ -78,6 +78,7 @@ public final class TableProcessor implements RunProcessor {
             metrics.recordRunSuccess(id, run.kind(), fileCount, elapsedSince(startNanos));
             return true;
         } catch (RuntimeException | Error e) {
+            log.warn("Run failed kind={} maxSeq={} table={}", run.kind(), run.maxSeq(), id, e);
             metrics.recordRunFailure(id, run.kind(), fileCount, elapsedSince(startNanos), e);
             throw e;
         }

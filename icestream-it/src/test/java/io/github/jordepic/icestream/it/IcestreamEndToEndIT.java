@@ -104,6 +104,7 @@ class IcestreamEndToEndIT {
     private static GenericContainer<?> flinkTaskManager;
     private static GenericContainer<?> sparkCompaction;
     private static Path flinkLibDir;
+    private static Path sparkCompactionLibDir;
 
     @BeforeAll
     static void startStack() {
@@ -149,6 +150,7 @@ class IcestreamEndToEndIT {
         kafka.start();
 
         flinkLibDir = Paths.get(System.getProperty("icestream.it.flinkLibDir"));
+        sparkCompactionLibDir = Paths.get(System.getProperty("icestream.it.sparkCompactionLibDir"));
         flinkJobManager = withFlinkLibs(
                         new GenericContainer<>(FLINK_IMAGE)
                                 .withNetwork(network)
@@ -330,7 +332,7 @@ class IcestreamEndToEndIT {
     }
 
     private static void startSparkCompaction() {
-        sparkCompaction = new GenericContainer<>(DockerImageName.parse("tabulario/spark-iceberg:latest"))
+        GenericContainer<?> container = new GenericContainer<>(DockerImageName.parse("apache/spark:3.5.4-java17"))
                 .withNetwork(network)
                 .withNetworkAliases("spark-compaction")
                 .withCopyFileToContainer(
@@ -338,30 +340,39 @@ class IcestreamEndToEndIT {
                 .withEnv("AWS_ACCESS_KEY_ID", AWS_ACCESS_KEY)
                 .withEnv("AWS_SECRET_ACCESS_KEY", AWS_SECRET_KEY)
                 .withEnv("AWS_REGION", "us-east-1")
-                .withCreateContainerCmdModifier(cmd -> cmd.withEntrypoint("/bin/bash"))
                 .withCommand(
-                        "-c",
-                        String.join(
-                                " ",
-                                "spark-submit",
-                                "--conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                                "--conf spark.sql.defaultCatalog=iceberg",
-                                "--conf spark.sql.catalog.iceberg=org.apache.iceberg.spark.SparkCatalog",
-                                "--conf spark.sql.catalog.iceberg.catalog-impl=org.apache.iceberg.rest.RESTCatalog",
-                                "--conf spark.sql.catalog.iceberg.uri=http://rest:8181",
-                                "--conf spark.sql.catalog.iceberg.warehouse=s3://" + S3_BUCKET + "/",
-                                "--conf spark.sql.catalog.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO",
-                                "--conf spark.sql.catalog.iceberg.s3.endpoint=http://minio:9000",
-                                "--conf spark.sql.catalog.iceberg.s3.path-style-access=true",
-                                "--conf spark.sql.catalog.iceberg.s3.access-key-id=" + AWS_ACCESS_KEY,
-                                "--conf spark.sql.catalog.iceberg.s3.secret-access-key=" + AWS_SECRET_KEY,
-                                "--conf spark.sql.catalog.iceberg.client.region=us-east-1",
-                                "--conf spark.sql.catalog.iceberg.cache-enabled=false",
-                                "/scripts/compaction_loop.py"))
+                        "/opt/spark/bin/spark-submit",
+                        "--conf", "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+                        "--conf", "spark.sql.defaultCatalog=iceberg",
+                        "--conf", "spark.sql.catalog.iceberg=org.apache.iceberg.spark.SparkCatalog",
+                        "--conf", "spark.sql.catalog.iceberg.catalog-impl=org.apache.iceberg.rest.RESTCatalog",
+                        "--conf", "spark.sql.catalog.iceberg.uri=http://rest:8181",
+                        "--conf", "spark.sql.catalog.iceberg.warehouse=s3://" + S3_BUCKET + "/",
+                        "--conf", "spark.sql.catalog.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO",
+                        "--conf", "spark.sql.catalog.iceberg.s3.endpoint=http://minio:9000",
+                        "--conf", "spark.sql.catalog.iceberg.s3.path-style-access=true",
+                        "--conf", "spark.sql.catalog.iceberg.s3.access-key-id=" + AWS_ACCESS_KEY,
+                        "--conf", "spark.sql.catalog.iceberg.s3.secret-access-key=" + AWS_SECRET_KEY,
+                        "--conf", "spark.sql.catalog.iceberg.client.region=us-east-1",
+                        "--conf", "spark.sql.catalog.iceberg.cache-enabled=false",
+                        "/scripts/compaction_loop.py")
                 .withStartupTimeout(Duration.ofMinutes(5))
                 .waitingFor(Wait.forLogMessage(".*compaction loop starting.*", 1))
                 .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("spark-compaction"));
+        sparkCompaction = withSparkCompactionLibs(container, sparkCompactionLibDir);
         sparkCompaction.start();
+    }
+
+    private static GenericContainer<?> withSparkCompactionLibs(GenericContainer<?> container, Path libDir) {
+        try (Stream<Path> jars = Files.list(libDir)) {
+            jars.filter(p -> p.toString().endsWith(".jar"))
+                    .forEach(jar -> container.withCopyFileToContainer(
+                            MountableFile.forHostPath(jar),
+                            "/opt/spark/jars/" + jar.getFileName().toString()));
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed enumerating " + libDir, e);
+        }
+        return container;
     }
 
     private static void assertIcestreamSnapshotsAreNoOps(Table table) throws IOException {
