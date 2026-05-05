@@ -10,7 +10,9 @@
     <packaging>pom</packaging>
 
     <modules>
-        <module>icestream</module>
+        <module>icestream-common</module>
+        <module>icestream-spark-cassandra</module>
+        <module>icestream-flink-paimon</module>
         <module>icestream-it</module>
     </modules>
 
@@ -24,6 +26,8 @@
         <flink.version>2.0.0</flink.version>
         <flink.iceberg.connector.version>2.0</flink.iceberg.connector.version>
         <flink.kafka.connector.version>4.0.1-2.0</flink.kafka.connector.version>
+        <flink.major.version>2.0</flink.major.version>
+        <paimon.version>1.4-SNAPSHOT</paimon.version>
         <kafka.client.version>3.7.0</kafka.client.version>
         <parquet.version>1.17.0</parquet.version>
         <spark.version>3.5.4</spark.version>

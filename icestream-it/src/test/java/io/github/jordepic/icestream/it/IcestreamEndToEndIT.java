@@ -3,10 +3,10 @@ package io.github.jordepic.icestream.it;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.datastax.oss.driver.api.core.CqlSession;
-import io.github.jordepic.icestream.cassandra.CassandraIndex;
+import io.github.jordepic.icestream.sparkcassandra.cassandra.CassandraIndex;
 import io.github.jordepic.icestream.converter.ConversionCommitter;
-import io.github.jordepic.icestream.converter.DeleteFileCreator;
-import io.github.jordepic.icestream.indexer.DataFileIndexer;
+import io.github.jordepic.icestream.sparkcassandra.converter.SparkDeleteFileCreator;
+import io.github.jordepic.icestream.sparkcassandra.indexer.SparkDataFileIndexer;
 import io.github.jordepic.icestream.master.IcestreamMetrics;
 import io.github.jordepic.icestream.master.MasterLoop;
 import io.github.jordepic.icestream.master.TableProcessor;
@@ -519,8 +519,8 @@ class IcestreamEndToEndIT {
         CassandraIndex cassandraIndex = new CassandraIndex(cql, CASSANDRA_KEYSPACE);
         TableProcessor processor = new TableProcessor(
                 new SnapshotPlanner(),
-                new DataFileIndexer(spark, cassandraIndex),
-                new DeleteFileCreator(spark, cassandraIndex),
+                new SparkDataFileIndexer(spark, cassandraIndex),
+                new SparkDeleteFileCreator(spark, cassandraIndex),
                 cassandraIndex,
                 metrics);
         return new MasterLoop(catalog, processor, ICESTREAM_POLL, ICESTREAM_IDLE_BACKOFF, 2);
@@ -599,7 +599,7 @@ class IcestreamEndToEndIT {
         Map<String, String> props = new HashMap<>();
         props.put(TableProperties.FORMAT_VERSION, "2");
         props.put(IcestreamProperties.PRIMARY_KEYS, "id");
-        props.put(IcestreamProperties.CASSANDRA_BUCKETS, "4");
+        props.put(IcestreamProperties.INDEX_BUCKETS, "4");
         return props;
     }
 }

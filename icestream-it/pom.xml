@@ -19,14 +19,14 @@
     <dependencies>
         <dependency>
             <groupId>io.github.jordepic</groupId>
-            <artifactId>icestream</artifactId>
+            <artifactId>icestream-spark-cassandra</artifactId>
             <version>${project.version}</version>
             <scope>test</scope>
             <exclusions>
                 <!-- iceberg-spark-runtime is a shaded fat jar that ships its own
                      org.apache.iceberg.PartitionData with shaded avro return types.
-                     icestream uses iceberg-core APIs directly so the runtime fat jar
-                     is not needed at IT test time, and including it conflicts with the
+                     icestream-spark-cassandra uses iceberg-core APIs directly so the runtime fat
+                     jar is not needed at IT test time, and including it conflicts with the
                      real iceberg-core PartitionData on the classpath. -->
                 <exclusion>
                     <groupId>org.apache.iceberg</groupId>
