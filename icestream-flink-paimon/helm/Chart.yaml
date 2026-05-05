@@ -1,0 +1,11 @@
+apiVersion: v2
+name: icestream-flink-paimon
+description: |
+  icestream master (Flink + Paimon backend) — async eq-delete to deletion-vector
+  indexer for Iceberg. The master pod orchestrates the polling loop and submits
+  per-fileRun batch jobs to a long-lived Flink session cluster managed by
+  flink-kubernetes-operator. The secondary index lives in Paimon on the same
+  object store as the iceberg warehouse.
+type: application
+version: 1.0.0
+appVersion: "1.0-SNAPSHOT"

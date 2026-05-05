@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "icestream.fullname" . }}
+  labels:
+    {{- include "icestream.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "icestream.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "icestream.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "icestream.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: master
+          image: {{ include "icestream.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: ICESTREAM_ICEBERG_REST_URI
+              value: {{ .Values.appConfig.iceberg.restUri | quote }}
+            - name: ICESTREAM_ICEBERG_WAREHOUSE
+              value: {{ .Values.appConfig.iceberg.warehouse | quote }}
+            {{- range $k, $v := .Values.appConfig.iceberg.extraOptions }}
+            - name: ICESTREAM_ICEBERG_OPT_{{ $k | upper | replace "." "_" | replace "-" "_" }}
+              value: {{ $v | quote }}
+            {{- end }}
+            - name: ICESTREAM_PAIMON_WAREHOUSE
+              value: {{ .Values.appConfig.paimon.warehouse | quote }}
+            - name: ICESTREAM_PAIMON_DATABASE
+              value: {{ .Values.appConfig.paimon.database | quote }}
+            {{- range $k, $v := .Values.appConfig.paimon.extraOptions }}
+            - name: ICESTREAM_PAIMON_OPT_{{ $k | upper | replace "." "_" | replace "-" "_" }}
+              value: {{ $v | quote }}
+            {{- end }}
+            - name: ICESTREAM_FLINK_MODE
+              value: {{ .Values.appConfig.flink.mode | quote }}
+            - name: ICESTREAM_FLINK_PARALLELISM
+              value: {{ .Values.appConfig.flink.parallelism | quote }}
+            - name: ICESTREAM_FLINK_JM_HOST
+              value: {{ .Values.appConfig.flink.sessionCluster.jmHost | quote }}
+            - name: ICESTREAM_FLINK_JM_PORT
+              value: {{ .Values.appConfig.flink.sessionCluster.jmPort | quote }}
+            - name: ICESTREAM_POLL_INTERVAL_SECONDS
+              value: {{ .Values.appConfig.icestream.pollIntervalSeconds | quote }}
+            - name: ICESTREAM_IDLE_BACKOFF_SECONDS
+              value: {{ .Values.appConfig.icestream.idleBackoffSeconds | quote }}
+            - name: ICESTREAM_MAX_CONCURRENT_TASKS
+              value: {{ .Values.appConfig.icestream.maxConcurrentTasks | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.masterResources | nindent 12 }}

@@ -1,0 +1,86 @@
+replicaCount: 1
+
+image:
+  repository: icestream/icestream-flink-paimon-master
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# In-cluster endpoints, plain values (no Secret) per the v1 deployment story.
+appConfig:
+  iceberg:
+    restUri: http://iceberg-rest:8181
+    warehouse: s3://warehouse/
+    # Free-form additional iceberg catalog options. Each entry is converted into
+    # an env var ICESTREAM_ICEBERG_OPT_<KEY> on the master pod, which Main parses
+    # back into the catalog props map.
+    extraOptions: {}
+      # s3.endpoint: http://minio:9000
+      # s3.path-style-access: "true"
+      # client.region: us-east-1
+  paimon:
+    warehouse: s3://warehouse/paimon/
+    database: icestream
+    # Free-form Paimon catalog options. Each entry becomes ICESTREAM_PAIMON_OPT_<KEY>.
+    extraOptions: {}
+      # metastore: filesystem
+      # s3.endpoint: http://minio:9000
+      # s3.access-key: minio-user
+      # s3.secret-key: minio-pass
+  flink:
+    # mode: "remote" submits to a long-lived session cluster (the FlinkDeployment
+    # CR below); "local" runs an in-pod MiniCluster (sized small for dev only).
+    mode: remote
+    parallelism: 4
+    # When mode=remote, points at the JM service the FlinkDeployment owns. By
+    # default this is the in-cluster name flink-kubernetes-operator gives the JM.
+    sessionCluster:
+      name: icestream-flink-session
+      jmHost: icestream-flink-session-rest
+      jmPort: 8081
+  icestream:
+    pollIntervalSeconds: 10
+    idleBackoffSeconds: 60
+    maxConcurrentTasks: 4
+
+# Long-lived Flink session cluster managed by flink-kubernetes-operator. Set
+# .enabled=false if you want to point at a pre-existing FlinkDeployment.
+flinkSessionCluster:
+  enabled: true
+  flinkVersion: v2_0
+  image: flink:2.0.0-scala_2.12-java17
+  jobManager:
+    resource:
+      cpu: 1
+      memory: 2048m
+    replicas: 1
+  taskManager:
+    resource:
+      cpu: 2
+      memory: 4096m
+    replicas: 2
+    numberOfTaskSlots: 2
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "2"
+    state.savepoints.dir: "file:///flink-data/savepoints"
+    state.checkpoints.dir: "file:///flink-data/checkpoints"
+
+masterResources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 1
+    memory: 2Gi
+
+serviceAccount:
+  create: true
+  annotations: {}
+  automountServiceAccountToken: true
+
+podAnnotations: {}
+podSecurityContext: {}
+extraEnv: []

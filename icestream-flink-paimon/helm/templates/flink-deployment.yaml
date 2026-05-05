@@ -1,0 +1,30 @@
+{{- if .Values.flinkSessionCluster.enabled -}}
+# Long-lived Flink session cluster reconciled by flink-kubernetes-operator. The
+# operator must already be installed cluster-wide for this CR to take effect.
+# The master pod talks to this cluster via REST (RestClusterClient) on the
+# service the operator creates: <metadata.name>-rest:8081.
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: {{ .Values.appConfig.flink.sessionCluster.name }}
+  labels:
+    {{- include "icestream.labels" . | nindent 4 }}
+spec:
+  image: {{ .Values.flinkSessionCluster.image }}
+  flinkVersion: {{ .Values.flinkSessionCluster.flinkVersion }}
+  flinkConfiguration:
+    {{- range $k, $v := .Values.flinkSessionCluster.flinkConfiguration }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+  serviceAccount: {{ include "icestream.serviceAccountName" . }}
+  jobManager:
+    resource:
+      cpu: {{ .Values.flinkSessionCluster.jobManager.resource.cpu }}
+      memory: {{ .Values.flinkSessionCluster.jobManager.resource.memory }}
+    replicas: {{ .Values.flinkSessionCluster.jobManager.replicas }}
+  taskManager:
+    resource:
+      cpu: {{ .Values.flinkSessionCluster.taskManager.resource.cpu }}
+      memory: {{ .Values.flinkSessionCluster.taskManager.resource.memory }}
+    replicas: {{ .Values.flinkSessionCluster.taskManager.replicas }}
+{{- end -}}
