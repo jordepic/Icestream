@@ -29,10 +29,25 @@ public final class PaimonIndex implements IndexBackend {
 
     private final Catalog catalog;
     private final String database;
+    private final java.util.Map<String, String> catalogOptionsForFlink;
 
-    public PaimonIndex(Catalog catalog, String database) {
+    public PaimonIndex(Catalog catalog, String database, java.util.Map<String, String> catalogOptionsForFlink) {
         this.catalog = catalog;
         this.database = database;
+        this.catalogOptionsForFlink = java.util.Map.copyOf(catalogOptionsForFlink);
+    }
+
+    /**
+     * Build a {@link PaimonIndex} together with the catalog it wraps; the warehouse path is
+     * captured as part of {@link #catalogOptionsForFlink()} so the converter can re-register the
+     * catalog with Flink's table environment.
+     */
+    public static PaimonIndex create(
+            String warehousePath, String database, java.util.Map<String, String> extraOptions) {
+        Catalog catalog = PaimonCatalogFactory.create(warehousePath, extraOptions);
+        java.util.Map<String, String> flinkOptions = new java.util.HashMap<>(extraOptions);
+        flinkOptions.put("warehouse", warehousePath);
+        return new PaimonIndex(catalog, database, flinkOptions);
     }
 
     public Catalog catalog() {
@@ -41,6 +56,15 @@ public final class PaimonIndex implements IndexBackend {
 
     public String database() {
         return database;
+    }
+
+    /**
+     * Options to feed into Flink's {@code CREATE CATALOG ... WITH (...)} when registering this
+     * Paimon catalog with a {@code TableEnvironment}. Includes the warehouse path and any
+     * filesystem-specific options the catalog was constructed with.
+     */
+    public java.util.Map<String, String> catalogOptionsForFlink() {
+        return catalogOptionsForFlink;
     }
 
     public Identifier identifierFor(TableIdentifier icebergTableId) {

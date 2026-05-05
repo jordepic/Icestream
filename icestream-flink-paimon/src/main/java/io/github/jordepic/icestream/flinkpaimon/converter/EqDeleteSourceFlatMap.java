@@ -41,12 +41,13 @@ public final class EqDeleteSourceFlatMap implements FlatMapFunction<EqDeleteWork
 
     @Override
     public void flatMap(EqDeleteWorkItem item, Collector<Row> out) {
+        String partitionHex = IndexEncoding.toHex(item.partitionBytes());
         DeleteLoader loader =
                 new BaseDeleteLoader(file -> serializableTable.io().newInputFile(file.location()));
         StructLikeSet rows = loader.loadEqualityDeletes(List.of(item.deleteFile()), pkSchema);
         for (StructLike row : rows) {
-            byte[] pkBytes = IndexEncoding.encodeAsAvroBytes(pkStruct, row);
-            out.collect(Row.of(item.specId(), item.partitionBytes(), pkBytes));
+            String pkHex = IndexEncoding.toHex(IndexEncoding.encodeAsAvroBytes(pkStruct, row));
+            out.collect(Row.of(item.specId(), partitionHex, pkHex));
         }
     }
 }

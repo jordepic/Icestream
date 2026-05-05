@@ -48,6 +48,39 @@ public final class IndexEncoding {
      * internal representation, ready to feed back to {@code PartitionSpec.partitionToPath} or
      * {@code OutputFileFactory.newOutputFile(spec, partition)}.
      */
+    private static final char[] HEX_CHARS = "0123456789abcdef".toCharArray();
+
+    /**
+     * Hex-encode a byte array. Used as the on-storage representation for partition_key and pk
+     * columns in the Paimon index table — Paimon's lookup machinery requires Comparable types,
+     * and byte[] is not Comparable.
+     */
+    public static String toHex(byte[] bytes) {
+        char[] out = new char[bytes.length * 2];
+        for (int i = 0; i < bytes.length; i++) {
+            int v = bytes[i] & 0xff;
+            out[i * 2] = HEX_CHARS[v >>> 4];
+            out[i * 2 + 1] = HEX_CHARS[v & 0x0f];
+        }
+        return new String(out);
+    }
+
+    public static byte[] fromHex(String hex) {
+        if ((hex.length() & 1) != 0) {
+            throw new IllegalArgumentException("hex string has odd length");
+        }
+        byte[] out = new byte[hex.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            int hi = Character.digit(hex.charAt(i * 2), 16);
+            int lo = Character.digit(hex.charAt(i * 2 + 1), 16);
+            if (hi < 0 || lo < 0) {
+                throw new IllegalArgumentException("invalid hex char in " + hex);
+            }
+            out[i] = (byte) ((hi << 4) | lo);
+        }
+        return out;
+    }
+
     public static StructLike decodeFromAvroBytes(Types.StructType type, byte[] bytes) {
         PartitionData record = new PartitionData(type);
         if (type.fields().isEmpty()) {

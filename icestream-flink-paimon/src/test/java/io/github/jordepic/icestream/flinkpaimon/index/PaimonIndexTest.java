@@ -10,7 +10,6 @@ import java.util.Map;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.types.DataField;
@@ -21,18 +20,16 @@ import org.junit.jupiter.api.io.TempDir;
 
 class PaimonIndexTest {
 
-    private Catalog catalog;
     private PaimonIndex index;
 
     @BeforeEach
     void setUp(@TempDir Path warehouse) {
-        catalog = PaimonCatalogFactory.create(warehouse.toUri().toString(), Map.of());
-        index = new PaimonIndex(catalog, "icestream");
+        index = PaimonIndex.create(warehouse.toUri().toString(), "icestream", Map.of());
     }
 
     @AfterEach
     void tearDown() throws Exception {
-        catalog.close();
+        index.catalog().close();
     }
 
     @Test
@@ -42,7 +39,7 @@ class PaimonIndexTest {
 
         index.initializeForTable(tableId, config);
 
-        Table created = catalog.getTable(Identifier.create("icestream", "db_events"));
+        Table created = index.catalog().getTable(Identifier.create("icestream", "db_events"));
 
         assertThat(created.partitionKeys()).isEmpty();
         assertThat(created.primaryKeys()).containsExactly("spec_id", "partition_key", "pk");

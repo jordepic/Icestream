@@ -97,7 +97,7 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         int formatVersion =
                 ((HasTableOperations) table).operations().current().formatVersion();
 
-        Map<String, List<PerPositionMatch>> matchesByDataFile = runLookupJoin(table, workItems);
+        Map<String, List<PerPositionMatch>> matchesByDataFile = runLookupJoin(id, table, workItems);
         if (matchesByDataFile.isEmpty()) {
             return new CommitPlan(startingSnapshotId, new ArrayList<>(run.files()), List.of(), List.of());
         }
@@ -106,7 +106,8 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         return assemblePlan(startingSnapshotId, run, taskOutputs);
     }
 
-    private Map<String, List<PerPositionMatch>> runLookupJoin(Table icebergTable, List<EqDeleteWorkItem> workItems) {
+    private Map<String, List<PerPositionMatch>> runLookupJoin(
+            TableIdentifier id, Table icebergTable, List<EqDeleteWorkItem> workItems) {
         StreamExecutionEnvironment env = flink.newBatchEnv();
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         registerPaimonCatalog(tEnv);
@@ -114,24 +115,24 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         org.apache.iceberg.Schema pkSchema = new org.apache.iceberg.Schema(buildPkFields(icebergTable));
         StructType pkStruct = StructType.of(buildPkFields(icebergTable));
 
-        TypeInformation<Row> probeTypeInfo =
-                new RowTypeInfo(new TypeInformation[] {Types.INT, Types.PRIMITIVE_ARRAY(Types.BYTE), Types.PRIMITIVE_ARRAY(Types.BYTE)},
-                        new String[] {"spec_id", "partition_key", "pk"});
+        TypeInformation<Row> probeTypeInfo = new RowTypeInfo(
+                new TypeInformation[] {Types.INT, Types.STRING, Types.STRING},
+                new String[] {"spec_id", "partition_key", "pk"});
         DataStream<Row> probes = env.fromCollection(workItems, TypeInformation.of(EqDeleteWorkItem.class))
                 .flatMap(new EqDeleteSourceFlatMap(icebergTable, pkSchema, pkStruct))
                 .returns(probeTypeInfo);
 
         Schema probeSchema = Schema.newBuilder()
                 .column("spec_id", DataTypes.INT())
-                .column("partition_key", DataTypes.BYTES())
-                .column("pk", DataTypes.BYTES())
+                .column("partition_key", DataTypes.STRING())
+                .column("pk", DataTypes.STRING())
                 .columnByExpression("proc", "PROCTIME()")
                 .build();
         tEnv.createTemporaryView(EQ_DELETES_VIEW, tEnv.fromDataStream(probes, probeSchema));
 
         String indexFqn = String.format(
                 "`%s`.`%s`.`%s`",
-                PAIMON_CATALOG_NAME, paimonIndex.database(), paimonIndex.tableName(currentTableIdentifier(icebergTable)));
+                PAIMON_CATALOG_NAME, paimonIndex.database(), paimonIndex.tableName(id));
         String sql = "SELECT eq.spec_id, eq.partition_key, idx." + IndexTableSchema.COL_DATA_FILE_PATH
                 + ", idx." + IndexTableSchema.COL_POS
                 + " FROM " + EQ_DELETES_VIEW + " AS eq"
@@ -147,7 +148,7 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
             while (iter.hasNext()) {
                 Row row = iter.next();
                 int specId = (Integer) row.getField(0);
-                byte[] partitionBytes = (byte[]) row.getField(1);
+                byte[] partitionBytes = IndexEncoding.fromHex((String) row.getField(1));
                 String dataFilePath = (String) row.getField(2);
                 long pos = (Long) row.getField(3);
                 matchesByDataFile
@@ -155,8 +156,7 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
                         .add(new PerPositionMatch(pos, specId, partitionBytes));
             }
         } catch (Exception e) {
-            throw new RuntimeException(
-                    "Flink converter lookup-join failed for " + currentTableIdentifier(icebergTable), e);
+            throw new RuntimeException("Flink converter lookup-join failed for " + id, e);
         }
         return matchesByDataFile;
     }
@@ -217,7 +217,7 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
     private void registerPaimonCatalog(StreamTableEnvironment tEnv) {
         Map<String, String> options = new HashMap<>();
         options.put("type", "paimon");
-        options.putAll(((org.apache.paimon.catalog.AbstractCatalog) paimonIndex.catalog()).options());
+        options.putAll(paimonIndex.catalogOptionsForFlink());
         StringBuilder withClause = new StringBuilder();
         options.forEach((k, v) -> withClause.append("'").append(k).append("'='").append(v).append("',"));
         if (withClause.length() > 0) {
@@ -241,10 +241,6 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         // available here; defer: caller reconstructs it identically. Inline-derive from
         // IcestreamTableConfig.from(table).
         return IcestreamTableConfig.from(table).primaryKey().fields();
-    }
-
-    private static TableIdentifier currentTableIdentifier(Table table) {
-        return TableIdentifier.parse(table.name());
     }
 
     private CommitPlan assemblePlan(

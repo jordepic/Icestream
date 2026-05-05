@@ -31,13 +31,12 @@ public final class FlinkMain {
         log.info("Starting icestream Flink+Paimon master with {}", config);
 
         Catalog icebergCatalog = buildIcebergCatalog(config);
-        org.apache.paimon.catalog.Catalog paimonCatalog =
-                PaimonCatalogFactory.create(config.paimonWarehouse(), config.paimonOptions());
         FlinkContext flink = config.flinkMode().equals("remote")
                 ? FlinkContext.remote(config.flinkJmHost(), config.flinkJmPort(), config.flinkParallelism())
                 : FlinkContext.local(config.flinkParallelism());
 
-        PaimonIndex paimonIndex = new PaimonIndex(paimonCatalog, config.paimonDatabase());
+        PaimonIndex paimonIndex =
+                PaimonIndex.create(config.paimonWarehouse(), config.paimonDatabase(), config.paimonOptions());
         TableProcessor processor = new TableProcessor(
                 new SnapshotPlanner(),
                 new FlinkDataFileIndexer(flink, paimonIndex),
@@ -52,7 +51,7 @@ public final class FlinkMain {
                     log.info("Shutdown signal received");
                     loop.stop();
                     closeQuietly(flink::close, "flink");
-                    closeQuietly(paimonCatalog::close, "paimon-catalog");
+                    closeQuietly(paimonIndex.catalog()::close, "paimon-catalog");
                     if (icebergCatalog instanceof Closeable c) {
                         closeQuietly(c::close, "iceberg-catalog");
                     }

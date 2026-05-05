@@ -41,21 +41,22 @@ public final class DataFileFlatMap implements FlatMapFunction<FileWorkItem, RowD
 
     @Override
     public void flatMap(FileWorkItem item, Collector<RowData> out) throws Exception {
+        String partitionHex = IndexEncoding.toHex(item.partitionBytes());
         try (CloseableIterable<Record> records =
                 DataFileReader.read(serializableTable.io(), item.dataFile(), item.deletes(), pkProjection)) {
             for (Record record : records) {
-                byte[] pkBytes = IndexEncoding.encodeAsAvroBytes(pkStruct, record);
+                String pkHex = IndexEncoding.toHex(IndexEncoding.encodeAsAvroBytes(pkStruct, record));
                 long pos = (Long) record.getField(MetadataColumns.ROW_POSITION.name());
-                out.collect(toRowData(item.specId(), item.partitionBytes(), pkBytes, item.dataFilePath(), pos));
+                out.collect(toRowData(item.specId(), partitionHex, pkHex, item.dataFilePath(), pos));
             }
         }
     }
 
-    private static RowData toRowData(int specId, byte[] partitionBytes, byte[] pkBytes, String dataFilePath, long pos) {
+    private static RowData toRowData(int specId, String partitionHex, String pkHex, String dataFilePath, long pos) {
         GenericRowData row = new GenericRowData(5);
         row.setField(0, specId);
-        row.setField(1, partitionBytes);
-        row.setField(2, pkBytes);
+        row.setField(1, StringData.fromString(partitionHex));
+        row.setField(2, StringData.fromString(pkHex));
         row.setField(3, StringData.fromString(dataFilePath));
         row.setField(4, pos);
         return row;

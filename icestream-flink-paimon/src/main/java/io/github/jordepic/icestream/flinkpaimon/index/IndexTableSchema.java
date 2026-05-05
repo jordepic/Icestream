@@ -12,16 +12,17 @@ import org.apache.paimon.types.DataTypes;
  *
  * <p>Layout:
  * <ul>
- *   <li>columns {@code spec_id INT, partition_key VARBINARY(1024), pk VARBINARY(1024),
- *       data_file_path STRING, pos BIGINT}.
+ *   <li>columns {@code spec_id INT, partition_key STRING, pk STRING, data_file_path STRING,
+ *       pos BIGINT}. {@code partition_key} and {@code pk} carry hex-encoded avro bytes —
+ *       Paimon's lookup machinery requires Comparable types on PK columns, and {@code byte[]}
+ *       is not Comparable. Hex preserves byte ordering and stays sortable.
  *   <li>primary key {@code (spec_id, partition_key, pk)} — what the lookup join probes.
  * </ul>
  *
- * <p>The table is unpartitioned: Paimon's filesystem layout renders partition column values into
- * the path string, and {@code VARBINARY} has no sensible path representation. Mirroring iceberg's
- * partitioning at the Paimon level would require rendering the avro bytes as hex (or similar)
- * inside an extra STRING column. Deferred to a future iteration; for v1 we rely on bucketing
- * alone for write distribution and let the lookup-join probe across all buckets.
+ * <p>The table is unpartitioned for v1: enabling Paimon partitioning by {@code partition_key}
+ * would push the iceberg partition split down to the index storage but adds path-encoding
+ * complexity. We rely on bucketing alone for write distribution; the lookup join scans across
+ * all buckets, which is fine for the bounded eq-delete probe rate.
  *
  * <p>Options:
  * <ul>
@@ -41,16 +42,13 @@ public final class IndexTableSchema {
     public static final String COL_DATA_FILE_PATH = "data_file_path";
     public static final String COL_POS = "pos";
 
-    private static final int PARTITION_KEY_MAX_BYTES = 1024;
-    private static final int PK_MAX_BYTES = 1024;
-
     private IndexTableSchema() {}
 
     public static Schema build(IcestreamTableConfig config) {
         return Schema.newBuilder()
                 .column(COL_SPEC_ID, DataTypes.INT())
-                .column(COL_PARTITION_KEY, DataTypes.VARBINARY(PARTITION_KEY_MAX_BYTES))
-                .column(COL_PK, DataTypes.VARBINARY(PK_MAX_BYTES))
+                .column(COL_PARTITION_KEY, DataTypes.STRING())
+                .column(COL_PK, DataTypes.STRING())
                 .column(COL_DATA_FILE_PATH, DataTypes.STRING())
                 .column(COL_POS, DataTypes.BIGINT())
                 .primaryKey(COL_SPEC_ID, COL_PARTITION_KEY, COL_PK)
