@@ -98,15 +98,13 @@
             <artifactId>paimon-flink-${flink.major.version}</artifactId>
             <version>${paimon.version}</version>
         </dependency>
-        <!-- TODO: paimon-s3 once we implement S3-backed catalog wiring. Pending its install
-             at ~/.m2 (the paimon `flink2` profile builds it via `mvn -pl :paimon-s3 -am install`). -->
-        <!--
+        <!-- paimon-s3: enables s3:// (and s3a://) warehouses. Loaded reflectively by Paimon's
+             FileIO when the warehouse URI scheme matches; required for S3/MinIO-backed catalogs. -->
         <dependency>
             <groupId>org.apache.paimon</groupId>
             <artifactId>paimon-s3</artifactId>
             <version>${paimon.version}</version>
         </dependency>
-        -->
 
 
         <dependency>
