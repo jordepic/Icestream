@@ -1,0 +1,64 @@
+package io.github.jordepic.icestream.flinkpaimon.index;
+
+import io.github.jordepic.icestream.schema.IcestreamTableConfig;
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.types.DataTypes;
+
+/**
+ * Builds the Paimon {@link Schema} icestream uses for its secondary index table. Schema is
+ * deterministic given the iceberg-table config; called once when the index table is first
+ * created via {@link PaimonIndex#initializeForTable}.
+ *
+ * <p>Layout:
+ * <ul>
+ *   <li>partition columns {@code spec_id INT, partition_key VARBINARY(1024)} — mirror the
+ *       iceberg partition layout, with {@code partition_key} carrying the avro-encoded
+ *       {@link io.github.jordepic.icestream.index.IndexEncoding#encodeAsAvroBytes} bytes.
+ *   <li>primary key {@code (spec_id, partition_key, pk)}. In Paimon, primary keys must include
+ *       all partition keys when the table is partitioned.
+ *   <li>value columns {@code data_file_path STRING, pos BIGINT}.
+ * </ul>
+ *
+ * <p>Options:
+ * <ul>
+ *   <li>{@code bucket = icestream.index-buckets} — fixed-bucket mode (required for lookup join).
+ *   <li>{@code bucket-key = pk} — distribute rows across buckets by primary key.
+ *   <li>{@code deletion-vectors.enabled = true} — DV mode triggers lookup-friendly compaction
+ *       inside the writer, so we don't need {@code changelog-producer = lookup} on top.
+ *   <li>{@code num-sorted-run.compaction-trigger = 2} — lower than default 5; keep L0 small
+ *       between batches so lookup probes don't fan out.
+ * </ul>
+ *
+ * <p>{@code partition_key} length: 1024 is comfortably larger than any realistic iceberg partition
+ * tuple's avro encoding (a handful of primitive fields).
+ */
+public final class IndexTableSchema {
+
+    public static final String COL_SPEC_ID = "spec_id";
+    public static final String COL_PARTITION_KEY = "partition_key";
+    public static final String COL_PK = "pk";
+    public static final String COL_DATA_FILE_PATH = "data_file_path";
+    public static final String COL_POS = "pos";
+
+    private static final int PARTITION_KEY_MAX_BYTES = 1024;
+    private static final int PK_MAX_BYTES = 1024;
+
+    private IndexTableSchema() {}
+
+    public static Schema build(IcestreamTableConfig config) {
+        return Schema.newBuilder()
+                .column(COL_SPEC_ID, DataTypes.INT())
+                .column(COL_PARTITION_KEY, DataTypes.VARBINARY(PARTITION_KEY_MAX_BYTES))
+                .column(COL_PK, DataTypes.VARBINARY(PK_MAX_BYTES))
+                .column(COL_DATA_FILE_PATH, DataTypes.STRING())
+                .column(COL_POS, DataTypes.BIGINT())
+                .partitionKeys(COL_SPEC_ID, COL_PARTITION_KEY)
+                .primaryKey(COL_SPEC_ID, COL_PARTITION_KEY, COL_PK)
+                .option(CoreOptions.BUCKET.key(), Integer.toString(config.indexBuckets()))
+                .option(CoreOptions.BUCKET_KEY.key(), COL_PK)
+                .option(CoreOptions.DELETION_VECTORS_ENABLED.key(), "true")
+                .option(CoreOptions.NUM_SORTED_RUNS_COMPACTION_TRIGGER.key(), "2")
+                .build();
+    }
+}
