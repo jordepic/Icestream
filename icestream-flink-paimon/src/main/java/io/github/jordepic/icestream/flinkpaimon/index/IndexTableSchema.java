@@ -12,13 +12,16 @@ import org.apache.paimon.types.DataTypes;
  *
  * <p>Layout:
  * <ul>
- *   <li>partition columns {@code spec_id INT, partition_key VARBINARY(1024)} — mirror the
- *       iceberg partition layout, with {@code partition_key} carrying the avro-encoded
- *       {@link io.github.jordepic.icestream.index.IndexEncoding#encodeAsAvroBytes} bytes.
- *   <li>primary key {@code (spec_id, partition_key, pk)}. In Paimon, primary keys must include
- *       all partition keys when the table is partitioned.
- *   <li>value columns {@code data_file_path STRING, pos BIGINT}.
+ *   <li>columns {@code spec_id INT, partition_key VARBINARY(1024), pk VARBINARY(1024),
+ *       data_file_path STRING, pos BIGINT}.
+ *   <li>primary key {@code (spec_id, partition_key, pk)} — what the lookup join probes.
  * </ul>
+ *
+ * <p>The table is unpartitioned: Paimon's filesystem layout renders partition column values into
+ * the path string, and {@code VARBINARY} has no sensible path representation. Mirroring iceberg's
+ * partitioning at the Paimon level would require rendering the avro bytes as hex (or similar)
+ * inside an extra STRING column. Deferred to a future iteration; for v1 we rely on bucketing
+ * alone for write distribution and let the lookup-join probe across all buckets.
  *
  * <p>Options:
  * <ul>
@@ -29,9 +32,6 @@ import org.apache.paimon.types.DataTypes;
  *   <li>{@code num-sorted-run.compaction-trigger = 2} — lower than default 5; keep L0 small
  *       between batches so lookup probes don't fan out.
  * </ul>
- *
- * <p>{@code partition_key} length: 1024 is comfortably larger than any realistic iceberg partition
- * tuple's avro encoding (a handful of primitive fields).
  */
 public final class IndexTableSchema {
 
@@ -53,7 +53,6 @@ public final class IndexTableSchema {
                 .column(COL_PK, DataTypes.VARBINARY(PK_MAX_BYTES))
                 .column(COL_DATA_FILE_PATH, DataTypes.STRING())
                 .column(COL_POS, DataTypes.BIGINT())
-                .partitionKeys(COL_SPEC_ID, COL_PARTITION_KEY)
                 .primaryKey(COL_SPEC_ID, COL_PARTITION_KEY, COL_PK)
                 .option(CoreOptions.BUCKET.key(), Integer.toString(config.indexBuckets()))
                 .option(CoreOptions.BUCKET_KEY.key(), COL_PK)

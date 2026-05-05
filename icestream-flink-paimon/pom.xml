@@ -133,11 +133,31 @@
             <version>${assertj.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- Hadoop client: iceberg REST catalog needs Configuration; Paimon's filesystem catalog
+             needs the shaded woodstox classes inside client-runtime. Both compile-scope so the
+             master image ships them. -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-client-api</artifactId>
+            <version>3.3.6</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-client-runtime</artifactId>
+            <version>3.3.6</version>
+        </dependency>
+
         <!-- MiniCluster harness for Flink component tests. -->
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-test-utils</artifactId>
             <version>${flink.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>${slf4j.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
