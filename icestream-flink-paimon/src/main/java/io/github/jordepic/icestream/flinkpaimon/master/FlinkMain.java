@@ -1,8 +1,12 @@
 package io.github.jordepic.icestream.flinkpaimon.master;
 
+import static io.github.jordepic.icestream.master.EnvConfig.envOrDefault;
+import static io.github.jordepic.icestream.master.EnvConfig.optionsFromEnv;
+import static io.github.jordepic.icestream.master.EnvConfig.requireEnv;
+import static io.github.jordepic.icestream.master.LifecycleHooks.closeQuietly;
+
 import io.github.jordepic.icestream.flinkpaimon.converter.FlinkDeleteFileCreator;
 import io.github.jordepic.icestream.flinkpaimon.flink.FlinkContext;
-import io.github.jordepic.icestream.flinkpaimon.index.PaimonCatalogFactory;
 import io.github.jordepic.icestream.flinkpaimon.index.PaimonIndex;
 import io.github.jordepic.icestream.flinkpaimon.indexer.FlinkDataFileIndexer;
 import io.github.jordepic.icestream.master.IcestreamMetrics;
@@ -73,19 +77,6 @@ public final class FlinkMain {
                 new Configuration());
     }
 
-    private static void closeQuietly(ThrowingRunnable closer, String label) {
-        try {
-            closer.run();
-        } catch (Exception e) {
-            log.warn("Error closing {}", label, e);
-        }
-    }
-
-    @FunctionalInterface
-    private interface ThrowingRunnable {
-        void run() throws Exception;
-    }
-
     record Config(
             String icebergRestUri,
             String icebergWarehouse,
@@ -116,30 +107,6 @@ public final class FlinkMain {
                     Duration.ofSeconds(Long.parseLong(envOrDefault("ICESTREAM_POLL_INTERVAL_SECONDS", "10"))),
                     Duration.ofSeconds(Long.parseLong(envOrDefault("ICESTREAM_IDLE_BACKOFF_SECONDS", "60"))),
                     Integer.parseInt(envOrDefault("ICESTREAM_MAX_CONCURRENT_TASKS", "4")));
-        }
-
-        private static Map<String, String> optionsFromEnv(String prefix) {
-            Map<String, String> out = new HashMap<>();
-            System.getenv().forEach((k, v) -> {
-                if (k.startsWith(prefix)) {
-                    String key = k.substring(prefix.length()).toLowerCase().replace('_', '.');
-                    out.put(key, v);
-                }
-            });
-            return out;
-        }
-
-        private static String requireEnv(String key) {
-            String value = System.getenv(key);
-            if (value == null || value.isBlank()) {
-                throw new IllegalStateException("Missing required env var " + key);
-            }
-            return value;
-        }
-
-        private static String envOrDefault(String key, String fallback) {
-            String value = System.getenv(key);
-            return (value == null || value.isBlank()) ? fallback : value;
         }
     }
 }

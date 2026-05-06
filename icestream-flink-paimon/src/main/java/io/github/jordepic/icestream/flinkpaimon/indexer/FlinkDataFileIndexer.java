@@ -2,11 +2,10 @@ package io.github.jordepic.icestream.flinkpaimon.indexer;
 
 import io.github.jordepic.icestream.flinkpaimon.flink.FlinkContext;
 import io.github.jordepic.icestream.flinkpaimon.index.PaimonIndex;
-import io.github.jordepic.icestream.index.IndexEncoding;
 import io.github.jordepic.icestream.indexer.DataIndexer;
+import io.github.jordepic.icestream.indexer.FileWorkItem;
 import io.github.jordepic.icestream.planner.DataFileRun;
 import io.github.jordepic.icestream.schema.IcestreamTableConfig;
-import java.util.ArrayList;
 import java.util.List;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -15,8 +14,6 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
 import org.apache.flink.table.types.logical.RowType;
-import org.apache.iceberg.DataFile;
-import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -51,7 +48,7 @@ public final class FlinkDataFileIndexer implements DataIndexer {
         if (run.files().isEmpty()) {
             return;
         }
-        List<FileWorkItem> workItems = buildWorkItems(table, run);
+        List<FileWorkItem> workItems = FileWorkItem.buildAll(table, run);
         Schema pkProjection = new Schema(config.primaryKey().fields());
         Types.StructType pkStruct = Types.StructType.of(config.primaryKey().fields());
         FileStoreTable indexTable = (FileStoreTable) paimonIndex.load(id);
@@ -71,15 +68,5 @@ public final class FlinkDataFileIndexer implements DataIndexer {
         } catch (Exception e) {
             throw new RuntimeException("Flink indexer job failed for table " + id + " maxSeq " + run.maxSeq(), e);
         }
-    }
-
-    private static List<FileWorkItem> buildWorkItems(Table table, DataFileRun run) {
-        List<FileWorkItem> items = new ArrayList<>(run.files().size());
-        for (DataFile file : run.files()) {
-            PartitionSpec spec = table.specs().get(file.specId());
-            byte[] partitionBytes = IndexEncoding.encodeAsAvroBytes(spec.partitionType(), file.partition());
-            items.add(new FileWorkItem(file, run.deletesFor(file), file.specId(), partitionBytes, file.location()));
-        }
-        return items;
     }
 }

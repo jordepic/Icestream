@@ -1,5 +1,9 @@
 package io.github.jordepic.icestream.sparkcassandra.master;
 
+import static io.github.jordepic.icestream.master.EnvConfig.envOrDefault;
+import static io.github.jordepic.icestream.master.EnvConfig.requireEnv;
+import static io.github.jordepic.icestream.master.LifecycleHooks.closeQuietly;
+
 import com.datastax.oss.driver.api.core.CqlSession;
 import io.github.jordepic.icestream.master.IcestreamMetrics;
 import io.github.jordepic.icestream.master.MasterLoop;
@@ -82,20 +86,6 @@ public final class SparkMain {
                 + " WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
     }
 
-    private static void closeQuietly(ThrowingRunnable closer, String label) {
-        try {
-            closer.run();
-        } catch (Exception e) {
-            log.warn("Error closing {}", label, e);
-        }
-    }
-
-    @FunctionalInterface
-    private interface ThrowingRunnable {
-
-        void run() throws Exception;
-    }
-
     record Config(
             String catalogName,
             String cassandraHost,
@@ -116,19 +106,6 @@ public final class SparkMain {
                     Duration.ofSeconds(Long.parseLong(envOrDefault("ICESTREAM_POLL_INTERVAL_SECONDS", "10"))),
                     Duration.ofSeconds(Long.parseLong(envOrDefault("ICESTREAM_IDLE_BACKOFF_SECONDS", "60"))),
                     Integer.parseInt(envOrDefault("ICESTREAM_MAX_CONCURRENT_TASKS", "4")));
-        }
-
-        private static String requireEnv(String key) {
-            String value = System.getenv(key);
-            if (value == null || value.isBlank()) {
-                throw new IllegalStateException("Missing required env var " + key);
-            }
-            return value;
-        }
-
-        private static String envOrDefault(String key, String fallback) {
-            String value = System.getenv(key);
-            return (value == null || value.isBlank()) ? fallback : value;
         }
     }
 }

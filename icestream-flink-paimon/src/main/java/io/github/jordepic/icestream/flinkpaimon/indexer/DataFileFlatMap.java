@@ -2,6 +2,7 @@ package io.github.jordepic.icestream.flinkpaimon.indexer;
 
 import io.github.jordepic.icestream.index.IndexEncoding;
 import io.github.jordepic.icestream.indexer.DataFileReader;
+import io.github.jordepic.icestream.indexer.FileWorkItem;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;

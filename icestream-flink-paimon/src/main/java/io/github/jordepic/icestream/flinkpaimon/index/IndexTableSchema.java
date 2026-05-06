@@ -19,10 +19,11 @@ import org.apache.paimon.types.DataTypes;
  *   <li>primary key {@code (spec_id, partition_key, pk)} — what the lookup join probes.
  * </ul>
  *
- * <p>The table is unpartitioned for v1: enabling Paimon partitioning by {@code partition_key}
- * would push the iceberg partition split down to the index storage but adds path-encoding
- * complexity. We rely on bucketing alone for write distribution; the lookup join scans across
- * all buckets, which is fine for the bounded eq-delete probe rate.
+ * <p>Partitioning: {@code (spec_id, partition_key)}. Mirrors the iceberg table's partition
+ * layout so Paimon's filesystem write places each iceberg partition's index rows into a distinct
+ * Paimon partition directory, and Flink's lookup join can prune to the matching partition per
+ * probe row (the join condition includes equality on both partition columns). The hex-encoded
+ * {@code STRING} partition_key renders cleanly into the path string.
  *
  * <p>Options:
  * <ul>
@@ -51,6 +52,7 @@ public final class IndexTableSchema {
                 .column(COL_PK, DataTypes.STRING())
                 .column(COL_DATA_FILE_PATH, DataTypes.STRING())
                 .column(COL_POS, DataTypes.BIGINT())
+                .partitionKeys(COL_SPEC_ID, COL_PARTITION_KEY)
                 .primaryKey(COL_SPEC_ID, COL_PARTITION_KEY, COL_PK)
                 .option(CoreOptions.BUCKET.key(), Integer.toString(config.indexBuckets()))
                 .option(CoreOptions.BUCKET_KEY.key(), COL_PK)

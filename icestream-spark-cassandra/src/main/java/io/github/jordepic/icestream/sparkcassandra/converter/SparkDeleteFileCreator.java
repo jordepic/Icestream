@@ -9,30 +9,23 @@ import com.datastax.spark.connector.ColumnSelector;
 import com.datastax.spark.connector.japi.rdd.CassandraJavaPairRDD;
 import io.github.jordepic.icestream.converter.CommitPlan;
 import io.github.jordepic.icestream.converter.DeleteConverter;
+import io.github.jordepic.icestream.converter.DeleteFileCreatorSupport;
 import io.github.jordepic.icestream.converter.EqDeleteWorkItem;
 import io.github.jordepic.icestream.converter.PartitionKey;
 import io.github.jordepic.icestream.converter.PerPositionMatch;
 import io.github.jordepic.icestream.converter.TaskOutputs;
-import io.github.jordepic.icestream.index.IndexEncoding;
 import io.github.jordepic.icestream.planner.EqualityDeleteFileRun;
 import io.github.jordepic.icestream.schema.IcestreamTableConfig;
 import io.github.jordepic.icestream.sparkcassandra.cassandra.CassandraIndex;
 import io.github.jordepic.icestream.sparkcassandra.cassandra.JoinedFileLocation;
 import io.github.jordepic.icestream.sparkcassandra.cassandra.SerializableEqualityDelete;
-import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.stream.Collectors;
-import org.apache.iceberg.DeleteFile;
-import org.apache.iceberg.HasTableOperations;
-import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SerializableTable;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.types.Types;
-import org.apache.iceberg.util.CharSequenceSet;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
@@ -89,11 +82,9 @@ public final class SparkDeleteFileCreator implements DeleteConverter {
         if (run.files().isEmpty()) {
             return new CommitPlan(startingSnapshotId, List.of(), List.of(), List.of());
         }
-        DeleteFileStrategy strategy = pickStrategy(table);
-        List<EqDeleteWorkItem> workItems = buildEqDeleteWorkItems(table, run);
-        Set<PartitionKey> touchedPartitions = workItems.stream()
-                .map(item -> new PartitionKey(item.specId(), item.partitionBytes()))
-                .collect(Collectors.toSet());
+        DeleteFileStrategy strategy = pickStrategy(DeleteFileCreatorSupport.requireSupportedFormatVersion(table));
+        List<EqDeleteWorkItem> workItems = DeleteFileCreatorSupport.buildWorkItems(table, run);
+        Set<PartitionKey> touchedPartitions = DeleteFileCreatorSupport.touchedPartitions(workItems);
 
         JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
         Broadcast<Table> tableBroadcast = jsc.broadcast(SerializableTable.copyOf(table));
@@ -105,17 +96,14 @@ public final class SparkDeleteFileCreator implements DeleteConverter {
                         jsc, tableBroadcast, table, touchedPartitions, byDataFile)
                 .collect();
 
-        return assemblePlan(startingSnapshotId, run, taskOutputs);
+        return DeleteFileCreatorSupport.assemblePlan(startingSnapshotId, run, taskOutputs);
     }
 
-    private static DeleteFileStrategy pickStrategy(Table table) {
-        int formatVersion =
-                ((HasTableOperations) table).operations().current().formatVersion();
+    private static DeleteFileStrategy pickStrategy(int formatVersion) {
         return switch (formatVersion) {
             case 2 -> new SparkPosDeleteFileStrategy();
             case 3 -> new SparkDvFileStrategy();
-            default -> throw new IllegalArgumentException(
-                    "icestream only supports v2 and v3 tables; got format-version=" + formatVersion);
+            default -> throw new IllegalStateException("unreachable: format-version=" + formatVersion);
         };
     }
 
@@ -156,29 +144,4 @@ public final class SparkDeleteFileCreator implements DeleteConverter {
                                 new PerPositionMatch(t._2.getPos(), t._1.getSpecId(), t._1.getPartitionKey())));
     }
 
-    private List<EqDeleteWorkItem> buildEqDeleteWorkItems(Table table, EqualityDeleteFileRun run) {
-        List<EqDeleteWorkItem> items = new ArrayList<>(run.files().size());
-        for (DeleteFile file : run.files()) {
-            PartitionSpec spec = table.specs().get(file.specId());
-            byte[] partitionBytes = IndexEncoding.encodeAsAvroBytes(spec.partitionType(), file.partition());
-            items.add(new EqDeleteWorkItem(file, file.specId(), partitionBytes));
-        }
-        return items;
-    }
-
-    private CommitPlan assemblePlan(
-            long startingSnapshotId, EqualityDeleteFileRun run, List<TaskOutputs> taskOutputs) {
-        List<DeleteFile> newDeletes = new ArrayList<>();
-        List<DeleteFile> rewrittenDeletes = new ArrayList<>();
-        CharSequenceSet seenRewrittenLocations = CharSequenceSet.empty();
-        for (TaskOutputs output : taskOutputs) {
-            newDeletes.addAll(output.newDeletes());
-            for (DeleteFile rewritten : output.rewrittenDeletes()) {
-                if (seenRewrittenLocations.add(rewritten.location())) {
-                    rewrittenDeletes.add(rewritten);
-                }
-            }
-        }
-        return new CommitPlan(startingSnapshotId, new ArrayList<>(run.files()), rewrittenDeletes, newDeletes);
-    }
 }

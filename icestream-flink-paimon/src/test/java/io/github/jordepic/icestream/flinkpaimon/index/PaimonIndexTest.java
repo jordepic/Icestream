@@ -41,7 +41,7 @@ class PaimonIndexTest {
 
         Table created = index.catalog().getTable(Identifier.create("icestream", "db_events"));
 
-        assertThat(created.partitionKeys()).isEmpty();
+        assertThat(created.partitionKeys()).containsExactly("spec_id", "partition_key");
         assertThat(created.primaryKeys()).containsExactly("spec_id", "partition_key", "pk");
         assertThat(created.options())
                 .containsEntry(CoreOptions.BUCKET.key(), "4")

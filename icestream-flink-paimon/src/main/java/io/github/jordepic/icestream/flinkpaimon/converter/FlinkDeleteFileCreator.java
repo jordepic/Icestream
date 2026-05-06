@@ -2,6 +2,7 @@ package io.github.jordepic.icestream.flinkpaimon.converter;
 
 import io.github.jordepic.icestream.converter.CommitPlan;
 import io.github.jordepic.icestream.converter.DeleteConverter;
+import io.github.jordepic.icestream.converter.DeleteFileCreatorSupport;
 import io.github.jordepic.icestream.converter.DeletionVectorLoader;
 import io.github.jordepic.icestream.converter.DvInfo;
 import io.github.jordepic.icestream.converter.EqDeleteWorkItem;
@@ -38,12 +39,10 @@ import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.HasTableOperations;
-import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.SerializableTable;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.types.Types.StructType;
-import org.apache.iceberg.util.CharSequenceSet;
 
 /**
  * Flink + Paimon implementation of {@link DeleteConverter}.
@@ -90,12 +89,9 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         if (run.files().isEmpty()) {
             return new CommitPlan(startingSnapshotId, List.of(), List.of(), List.of());
         }
-        List<EqDeleteWorkItem> workItems = buildWorkItems(table, run);
-        Set<PartitionKey> touchedPartitions = workItems.stream()
-                .map(item -> new PartitionKey(item.specId(), item.partitionBytes()))
-                .collect(Collectors.toSet());
-        int formatVersion =
-                ((HasTableOperations) table).operations().current().formatVersion();
+        List<EqDeleteWorkItem> workItems = DeleteFileCreatorSupport.buildWorkItems(table, run);
+        Set<PartitionKey> touchedPartitions = DeleteFileCreatorSupport.touchedPartitions(workItems);
+        int formatVersion = DeleteFileCreatorSupport.requireSupportedFormatVersion(table);
 
         Map<String, List<PerPositionMatch>> matchesByDataFile = runLookupJoin(id, table, workItems);
         if (matchesByDataFile.isEmpty()) {
@@ -103,7 +99,7 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         }
         List<TaskOutputs> taskOutputs =
                 writeDeleteFiles(table, formatVersion, matchesByDataFile, touchedPartitions);
-        return assemblePlan(startingSnapshotId, run, taskOutputs);
+        return DeleteFileCreatorSupport.assemblePlan(startingSnapshotId, run, taskOutputs);
     }
 
     private Map<String, List<PerPositionMatch>> runLookupJoin(
@@ -240,36 +236,7 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         tEnv.executeSql("CREATE CATALOG " + PAIMON_CATALOG_NAME + " WITH (" + withClause + ")");
     }
 
-    private List<EqDeleteWorkItem> buildWorkItems(Table table, EqualityDeleteFileRun run) {
-        List<EqDeleteWorkItem> items = new ArrayList<>(run.files().size());
-        for (DeleteFile file : run.files()) {
-            PartitionSpec spec = table.specs().get(file.specId());
-            byte[] partitionBytes = IndexEncoding.encodeAsAvroBytes(spec.partitionType(), file.partition());
-            items.add(new EqDeleteWorkItem(file, file.specId(), partitionBytes));
-        }
-        return items;
-    }
-
     private static List<org.apache.iceberg.types.Types.NestedField> buildPkFields(Table table) {
-        // Re-derive pk fields from the iceberg table + IcestreamTableConfig, but config isn't
-        // available here; defer: caller reconstructs it identically. Inline-derive from
-        // IcestreamTableConfig.from(table).
         return IcestreamTableConfig.from(table).primaryKey().fields();
-    }
-
-    private CommitPlan assemblePlan(
-            long startingSnapshotId, EqualityDeleteFileRun run, List<TaskOutputs> taskOutputs) {
-        List<DeleteFile> newDeletes = new ArrayList<>();
-        List<DeleteFile> rewrittenDeletes = new ArrayList<>();
-        CharSequenceSet seenRewrittenLocations = CharSequenceSet.empty();
-        for (TaskOutputs output : taskOutputs) {
-            newDeletes.addAll(output.newDeletes());
-            for (DeleteFile rewritten : output.rewrittenDeletes()) {
-                if (seenRewrittenLocations.add(rewritten.location())) {
-                    rewrittenDeletes.add(rewritten);
-                }
-            }
-        }
-        return new CommitPlan(startingSnapshotId, new ArrayList<>(run.files()), rewrittenDeletes, newDeletes);
     }
 }

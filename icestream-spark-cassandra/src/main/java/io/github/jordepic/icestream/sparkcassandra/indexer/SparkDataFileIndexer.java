@@ -8,19 +8,16 @@ import com.datastax.spark.connector.ColumnSelector;
 import io.github.jordepic.icestream.index.IndexEncoding;
 import io.github.jordepic.icestream.indexer.DataFileReader;
 import io.github.jordepic.icestream.indexer.DataIndexer;
+import io.github.jordepic.icestream.indexer.FileWorkItem;
 import io.github.jordepic.icestream.planner.DataFileRun;
 import io.github.jordepic.icestream.schema.IcestreamTableConfig;
 import io.github.jordepic.icestream.sparkcassandra.cassandra.CassandraIndex;
 import io.github.jordepic.icestream.sparkcassandra.cassandra.IndexRow;
 import io.github.jordepic.icestream.sparkcassandra.cassandra.SaltBucket;
-import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
-import org.apache.iceberg.DataFile;
-import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.MetadataColumns;
-import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -51,7 +48,7 @@ public final class SparkDataFileIndexer implements DataIndexer {
         if (run.files().isEmpty()) {
             return;
         }
-        List<FileWorkItem> workItems = buildWorkItems(table, run);
+        List<FileWorkItem> workItems = FileWorkItem.buildAll(table, run);
         FileIO io = table.io();
         Schema pkProjection = new Schema(config.primaryKey().fields());
         Types.StructType pkStructType = Types.StructType.of(config.primaryKey().fields());
@@ -76,47 +73,20 @@ public final class SparkDataFileIndexer implements DataIndexer {
                 .saveToCassandra();
     }
 
-    private List<FileWorkItem> buildWorkItems(Table table, DataFileRun run) {
-        List<FileWorkItem> items = new ArrayList<>(run.files().size());
-        for (DataFile file : run.files()) {
-            PartitionSpec spec = table.specs().get(file.specId());
-            byte[] partitionBytes = IndexEncoding.encodeAsAvroBytes(spec.partitionType(), file.partition());
-            items.add(new FileWorkItem(file, run.deletesFor(file), file.specId(), partitionBytes, file.location()));
-        }
-        return items;
-    }
-
     private static Iterator<IndexRow> encodeFile(
             FileWorkItem item, FileIO io, Schema pkProjection, Types.StructType pkStructType, int buckets)
             throws Exception {
         List<IndexRow> rows = new ArrayList<>();
-        try (CloseableIterable<Record> records = DataFileReader.read(io, item.dataFile, item.deletes, pkProjection)) {
+        try (CloseableIterable<Record> records =
+                DataFileReader.read(io, item.dataFile(), item.deletes(), pkProjection)) {
             for (Record record : records) {
                 byte[] pkBytes = IndexEncoding.encodeAsAvroBytes(pkStructType, record);
                 int bucket = SaltBucket.bucket(pkBytes, buckets);
                 long pos = (Long) record.getField(MetadataColumns.ROW_POSITION.name());
-                rows.add(new IndexRow(item.specId, item.partitionBytes, bucket, pkBytes, item.dataFilePath, pos));
+                rows.add(new IndexRow(
+                        item.specId(), item.partitionBytes(), bucket, pkBytes, item.dataFilePath(), pos));
             }
         }
         return rows.iterator();
-    }
-
-    private static final class FileWorkItem implements Serializable {
-
-        private static final long serialVersionUID = 1L;
-        private final DataFile dataFile;
-        private final List<DeleteFile> deletes;
-        private final int specId;
-        private final byte[] partitionBytes;
-        private final String dataFilePath;
-
-        FileWorkItem(
-                DataFile dataFile, List<DeleteFile> deletes, int specId, byte[] partitionBytes, String dataFilePath) {
-            this.dataFile = dataFile;
-            this.deletes = deletes;
-            this.specId = specId;
-            this.partitionBytes = partitionBytes;
-            this.dataFilePath = dataFilePath;
-        }
     }
 }
