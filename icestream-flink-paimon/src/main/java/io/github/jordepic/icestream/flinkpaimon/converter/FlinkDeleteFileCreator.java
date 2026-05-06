@@ -130,17 +130,7 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
                 .build();
         tEnv.createTemporaryView(EQ_DELETES_VIEW, tEnv.fromDataStream(probes, probeSchema));
 
-        String indexFqn = String.format(
-                "`%s`.`%s`.`%s`",
-                PAIMON_CATALOG_NAME, paimonIndex.database(), paimonIndex.tableName(id));
-        String sql = "SELECT eq.spec_id, eq.partition_key, idx." + IndexTableSchema.COL_DATA_FILE_PATH
-                + ", idx." + IndexTableSchema.COL_POS
-                + " FROM " + EQ_DELETES_VIEW + " AS eq"
-                + " LEFT JOIN " + indexFqn + " FOR SYSTEM_TIME AS OF eq.proc AS idx"
-                + " ON eq." + IndexTableSchema.COL_SPEC_ID + " = idx." + IndexTableSchema.COL_SPEC_ID
-                + " AND eq." + IndexTableSchema.COL_PARTITION_KEY + " = idx." + IndexTableSchema.COL_PARTITION_KEY
-                + " AND eq." + IndexTableSchema.COL_PK + " = idx." + IndexTableSchema.COL_PK
-                + " WHERE idx." + IndexTableSchema.COL_DATA_FILE_PATH + " IS NOT NULL";
+        String sql = buildLookupJoinSql(qualifiedIndexFqn(id));
 
         Map<String, List<PerPositionMatch>> matchesByDataFile = new LinkedHashMap<>();
         TableResult result = tEnv.sqlQuery(sql).execute();
@@ -212,6 +202,30 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         } catch (IOException e) {
             throw new RuntimeException("Failed writing pos-delete files", e);
         }
+    }
+
+    /**
+     * SQL the converter runs against its temporary view to drive the lookup join. Package-private
+     * so tests can call {@code tEnv.sqlQuery(...).explain()} on this and assert the planner
+     * picked Paimon's {@code FileStoreLookupFunction} (a {@code LookupJoin} operator) rather
+     * than a regular hash/sort-merge join — which would silently lose the indexed-probe semantics
+     * that are the whole point of moving from Spark+Cassandra to Flink+Paimon.
+     */
+    static String buildLookupJoinSql(String indexFqn) {
+        return "SELECT eq.spec_id, eq.partition_key, idx." + IndexTableSchema.COL_DATA_FILE_PATH
+                + ", idx." + IndexTableSchema.COL_POS
+                + " FROM " + EQ_DELETES_VIEW + " AS eq"
+                + " LEFT JOIN " + indexFqn + " FOR SYSTEM_TIME AS OF eq.proc AS idx"
+                + " ON eq." + IndexTableSchema.COL_SPEC_ID + " = idx." + IndexTableSchema.COL_SPEC_ID
+                + " AND eq." + IndexTableSchema.COL_PARTITION_KEY + " = idx." + IndexTableSchema.COL_PARTITION_KEY
+                + " AND eq." + IndexTableSchema.COL_PK + " = idx." + IndexTableSchema.COL_PK
+                + " WHERE idx." + IndexTableSchema.COL_DATA_FILE_PATH + " IS NOT NULL";
+    }
+
+    String qualifiedIndexFqn(TableIdentifier id) {
+        return String.format(
+                "`%s`.`%s`.`%s`",
+                PAIMON_CATALOG_NAME, paimonIndex.database(), paimonIndex.tableName(id));
     }
 
     private void registerPaimonCatalog(StreamTableEnvironment tEnv) {

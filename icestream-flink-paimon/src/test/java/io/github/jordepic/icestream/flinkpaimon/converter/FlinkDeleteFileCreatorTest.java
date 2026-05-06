@@ -108,6 +108,57 @@ class FlinkDeleteFileCreatorTest {
     }
 
     @Test
+    void lookupJoinPlanUsesPaimonFileStoreLookupFunction() {
+        TableIdentifier id = TableIdentifier.of("db", "events");
+        Table table = icebergCatalog.createTable(id, UNPARTITIONED_SCHEMA, PartitionSpec.unpartitioned(), v3Props());
+        IcestreamTableConfig config = IcestreamTableConfig.from(table);
+        paimonIndex.initializeForTable(id, config);
+
+        try (FlinkContext ctx = FlinkContext.local(1)) {
+            org.apache.flink.streaming.api.environment.StreamExecutionEnvironment env = ctx.newBatchEnv();
+            org.apache.flink.table.api.bridge.java.StreamTableEnvironment tEnv =
+                    org.apache.flink.table.api.bridge.java.StreamTableEnvironment.create(env);
+            registerPaimonCatalogForTest(tEnv);
+
+            org.apache.flink.streaming.api.datastream.DataStream<org.apache.flink.types.Row> empty =
+                    env.fromCollection(List.<org.apache.flink.types.Row>of(),
+                            new org.apache.flink.api.java.typeutils.RowTypeInfo(
+                                    new org.apache.flink.api.common.typeinfo.TypeInformation[] {
+                                        org.apache.flink.api.common.typeinfo.Types.INT,
+                                        org.apache.flink.api.common.typeinfo.Types.STRING,
+                                        org.apache.flink.api.common.typeinfo.Types.STRING
+                                    },
+                                    new String[] {"spec_id", "partition_key", "pk"}));
+            org.apache.flink.table.api.Schema probeSchema = org.apache.flink.table.api.Schema.newBuilder()
+                    .column("spec_id", org.apache.flink.table.api.DataTypes.INT())
+                    .column("partition_key", org.apache.flink.table.api.DataTypes.STRING())
+                    .column("pk", org.apache.flink.table.api.DataTypes.STRING())
+                    .columnByExpression("proc", "PROCTIME()")
+                    .build();
+            tEnv.createTemporaryView("icestream_eq_deletes", tEnv.fromDataStream(empty, probeSchema));
+
+            FlinkDeleteFileCreator creator = new FlinkDeleteFileCreator(ctx, paimonIndex);
+            String sql = FlinkDeleteFileCreator.buildLookupJoinSql(creator.qualifiedIndexFqn(id));
+            String plan = tEnv.sqlQuery(sql).explain();
+
+            assertThat(plan)
+                    .as(
+                            "Flink should pick LookupJoin against Paimon's FileStoreLookupFunction; "
+                                    + "if the plan picks a regular hash/sort-merge join we silently lose "
+                                    + "the indexed-probe semantics.\nPlan was:\n%s",
+                            plan)
+                    .contains("LookupJoin");
+        }
+    }
+
+    private void registerPaimonCatalogForTest(org.apache.flink.table.api.bridge.java.StreamTableEnvironment tEnv) {
+        StringBuilder withClause = new StringBuilder("'type'='paimon'");
+        paimonIndex.catalogOptionsForFlink().forEach((k, v) ->
+                withClause.append(",'").append(k).append("'='").append(v).append("'"));
+        tEnv.executeSql("CREATE CATALOG paimon WITH (" + withClause + ")");
+    }
+
+    @Test
     void emptyEqDeleteRunReturnsNoOpPlan() {
         TableIdentifier id = TableIdentifier.of("db", "events");
         Table table = icebergCatalog.createTable(id, UNPARTITIONED_SCHEMA, PartitionSpec.unpartitioned(), v3Props());
