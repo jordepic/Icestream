@@ -8,37 +8,29 @@ import io.github.jordepic.icestream.converter.DvInfo;
 import io.github.jordepic.icestream.converter.EqDeleteWorkItem;
 import io.github.jordepic.icestream.converter.ExistingPosDeleteLoader;
 import io.github.jordepic.icestream.converter.PartitionKey;
-import io.github.jordepic.icestream.converter.PerPositionMatch;
 import io.github.jordepic.icestream.converter.TaskOutputs;
-import io.github.jordepic.icestream.converter.writers.PerTaskDvWriter;
-import io.github.jordepic.icestream.converter.writers.PerTaskPosDeleteWriter;
 import io.github.jordepic.icestream.flinkpaimon.flink.FlinkContext;
 import io.github.jordepic.icestream.flinkpaimon.index.IndexTableSchema;
 import io.github.jordepic.icestream.flinkpaimon.index.PaimonIndex;
-import io.github.jordepic.icestream.index.IndexEncoding;
 import io.github.jordepic.icestream.planner.EqualityDeleteFileRun;
 import io.github.jordepic.icestream.schema.IcestreamTableConfig;
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.Schema;
-import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
 import org.apache.iceberg.DeleteFile;
-import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.SerializableTable;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -51,24 +43,22 @@ import org.apache.iceberg.types.Types.StructType;
  * <ol>
  *   <li>Build {@link EqDeleteWorkItem}s on the master JVM and pre-collect existing per-data-file
  *       scoped delete files in the touched partitions ({@link DeletionVectorLoader} for V3,
- *       {@link ExistingPosDeleteLoader} for V2).
+ *       {@link ExistingPosDeleteLoader} for V2). The existing-deletes maps are bounded by the
+ *       count of touched data files and are shipped into the per-task operator's serializable
+ *       state.
  *   <li>Build a fresh Flink batch env, source the work items, flatMap through
  *       {@link EqDeleteSourceFlatMap} into {@code (spec_id, partition_key, pk)} probe rows.
  *   <li>Convert the probe stream into a Table with a {@code PROCTIME} column, register the
  *       Paimon catalog, and run a SQL {@code LEFT JOIN ... FOR SYSTEM_TIME AS OF} against the
  *       index table — Flink's planner picks Paimon's {@code FileStoreLookupFunction}, giving
  *       per-row indexed probes.
- *   <li>Collect matches into the master JVM via {@code executeAndCollect}, group by
- *       {@code data_file_path}, and write per-data-file delete files via
- *       {@link PerTaskDvWriter} / {@link PerTaskPosDeleteWriter} on the driver.
- *   <li>Assemble the {@link CommitPlan} that the {@code TableProcessor} hands to the
- *       conversion committer.
+ *   <li>Convert the matches Table back to a {@code DataStream<Row>}, key by
+ *       {@code data_file_path}, and run {@link WriteDeleteFilesOperator} on TaskManagers — each
+ *       TM holds its own {@code PerTaskDvWriter} / {@code PerTaskPosDeleteWriter} for the keys
+ *       it owns and emits one {@link TaskOutputs} on end-of-input.
+ *   <li>Collect the {@link TaskOutputs} stream (one record per task slot) on the master JVM and
+ *       hand it to {@link DeleteFileCreatorSupport#assemblePlan} for the {@link CommitPlan}.
  * </ol>
- *
- * <p>Driver-side write: matches travel through the master JVM rather than being written on Flink
- * TaskManagers. Acceptable because the matches RDD is small relative to the index — eq-delete
- * counts per fileRun are bounded by what the writer emits per checkpoint window. Future
- * optimization: keyed Flink operator wrapping {@link PerTaskDvWriter} for parallel write.
  */
 public final class FlinkDeleteFileCreator implements DeleteConverter {
 
@@ -93,17 +83,25 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         Set<PartitionKey> touchedPartitions = DeleteFileCreatorSupport.touchedPartitions(workItems);
         int formatVersion = DeleteFileCreatorSupport.requireSupportedFormatVersion(table);
 
-        Map<String, List<PerPositionMatch>> matchesByDataFile = runLookupJoin(id, table, workItems);
-        if (matchesByDataFile.isEmpty()) {
-            return new CommitPlan(startingSnapshotId, new ArrayList<>(run.files()), List.of(), List.of());
-        }
+        Map<String, DvInfo> existingDvs = formatVersion == 3
+                ? DeletionVectorLoader.collect(table, touchedPartitions).serializableDeletesByDataFilePath()
+                : Map.of();
+        Map<String, List<DeleteFile>> existingPosDeletes = formatVersion == 2
+                ? ExistingPosDeleteLoader.collect(table, touchedPartitions)
+                : Map.of();
+
         List<TaskOutputs> taskOutputs =
-                writeDeleteFiles(table, formatVersion, matchesByDataFile, touchedPartitions);
+                runJob(id, table, workItems, formatVersion, existingDvs, existingPosDeletes);
         return DeleteFileCreatorSupport.assemblePlan(startingSnapshotId, run, taskOutputs);
     }
 
-    private Map<String, List<PerPositionMatch>> runLookupJoin(
-            TableIdentifier id, Table icebergTable, List<EqDeleteWorkItem> workItems) {
+    private List<TaskOutputs> runJob(
+            TableIdentifier id,
+            Table icebergTable,
+            List<EqDeleteWorkItem> workItems,
+            int formatVersion,
+            Map<String, DvInfo> existingDvs,
+            Map<String, List<DeleteFile>> existingPosDeletes) {
         StreamExecutionEnvironment env = flink.newBatchEnv();
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         registerPaimonCatalog(tEnv);
@@ -127,77 +125,28 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         tEnv.createTemporaryView(EQ_DELETES_VIEW, tEnv.fromDataStream(probes, probeSchema));
 
         String sql = buildLookupJoinSql(qualifiedIndexFqn(id));
+        DataStream<Row> matches = tEnv.toDataStream(tEnv.sqlQuery(sql));
 
-        Map<String, List<PerPositionMatch>> matchesByDataFile = new LinkedHashMap<>();
-        TableResult result = tEnv.sqlQuery(sql).execute();
-        try (CloseableIterator<Row> iter = result.collect()) {
+        SerializableTable serializableTable = (SerializableTable) SerializableTable.copyOf(icebergTable);
+        WriteDeleteFilesOperator operator = new WriteDeleteFilesOperator(
+                serializableTable,
+                formatVersion,
+                WriteDeleteFilesOperator.serializableDvMap(existingDvs),
+                WriteDeleteFilesOperator.serializablePosDeleteMap(existingPosDeletes));
+
+        DataStream<TaskOutputs> taskOutputsStream = matches
+                .keyBy(row -> (String) row.getField(2))
+                .transform("WriteDeleteFiles", TypeInformation.of(TaskOutputs.class), operator);
+
+        List<TaskOutputs> collected = new ArrayList<>();
+        try (CloseableIterator<TaskOutputs> iter = taskOutputsStream.executeAndCollect()) {
             while (iter.hasNext()) {
-                Row row = iter.next();
-                int specId = (Integer) row.getField(0);
-                byte[] partitionBytes = IndexEncoding.fromHex((String) row.getField(1));
-                String dataFilePath = (String) row.getField(2);
-                long pos = (Long) row.getField(3);
-                matchesByDataFile
-                        .computeIfAbsent(dataFilePath, k -> new ArrayList<>())
-                        .add(new PerPositionMatch(pos, specId, partitionBytes));
+                collected.add(iter.next());
             }
         } catch (Exception e) {
-            throw new RuntimeException("Flink converter lookup-join failed for " + id, e);
+            throw new RuntimeException("Flink converter job failed for " + id, e);
         }
-        return matchesByDataFile;
-    }
-
-    private List<TaskOutputs> writeDeleteFiles(
-            Table table,
-            int formatVersion,
-            Map<String, List<PerPositionMatch>> matchesByDataFile,
-            Set<PartitionKey> touchedPartitions) {
-        SerializableTable serializableTable = (SerializableTable) SerializableTable.copyOf(table);
-        return switch (formatVersion) {
-            case 2 -> writeV2(serializableTable, table, matchesByDataFile, touchedPartitions);
-            case 3 -> writeV3(serializableTable, table, matchesByDataFile, touchedPartitions);
-            default -> throw new IllegalArgumentException(
-                    "icestream only supports v2 and v3 tables; got format-version=" + formatVersion);
-        };
-    }
-
-    private List<TaskOutputs> writeV3(
-            SerializableTable serializableTable,
-            Table table,
-            Map<String, List<PerPositionMatch>> matchesByDataFile,
-            Set<PartitionKey> touchedPartitions) {
-        DeletionVectorLoader.CollectedDvs existing = DeletionVectorLoader.collect(table, touchedPartitions);
-        Map<String, DvInfo> existingByPath = existing.serializableDeletesByDataFilePath();
-        try (PerTaskDvWriter writer = new PerTaskDvWriter(serializableTable, 0, 0L)) {
-            existingByPath.forEach(writer::registerExistingDv);
-            for (Map.Entry<String, List<PerPositionMatch>> entry : matchesByDataFile.entrySet()) {
-                for (PerPositionMatch match : entry.getValue()) {
-                    writer.delete(entry.getKey(), match.pos(), match.specId(), match.partitionBytes());
-                }
-            }
-            return List.of(writer.finishAndClose());
-        } catch (IOException e) {
-            throw new RuntimeException("Failed writing DV files", e);
-        }
-    }
-
-    private List<TaskOutputs> writeV2(
-            SerializableTable serializableTable,
-            Table table,
-            Map<String, List<PerPositionMatch>> matchesByDataFile,
-            Set<PartitionKey> touchedPartitions) {
-        Map<String, List<DeleteFile>> existing = ExistingPosDeleteLoader.collect(table, touchedPartitions);
-        try (PerTaskPosDeleteWriter writer = new PerTaskPosDeleteWriter(serializableTable, 0, 0L)) {
-            existing.forEach(writer::registerExistingPosDeletes);
-            for (Map.Entry<String, List<PerPositionMatch>> entry : matchesByDataFile.entrySet()) {
-                for (PerPositionMatch match : entry.getValue()) {
-                    writer.delete(entry.getKey(), match.pos(), match.specId(), match.partitionBytes());
-                }
-            }
-            return List.of(writer.finishAndClose());
-        } catch (IOException e) {
-            throw new RuntimeException("Failed writing pos-delete files", e);
-        }
+        return collected;
     }
 
     /**
