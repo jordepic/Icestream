@@ -30,23 +30,15 @@ import org.apache.iceberg.io.FileWriterFactory;
 import org.apache.iceberg.io.OutputFileFactory;
 
 /**
- * Engine-agnostic V2 per-task writer. Wraps a {@link FanoutPositionOnlyDeleteWriter} with the
- * bookkeeping callers need:
- * <ul>
- *   <li>A local {@code Map<String, List<DeleteFile>>} that the writer's
- *       {@code loadPreviousDeletes} callback probes at close time, returning the existing
- *       file-scoped pos-deletes that should be folded into the new output.
- *   <li>A {@link PartitionKey} → {@link StructLike} cache so the avro-encoded partition bytes are
- *       decoded once per partition rather than per row.
- * </ul>
+ * V2 per-task writer. Wraps a {@link FanoutPositionOnlyDeleteWriter} configured with FILE
+ * granularity, plus a partition-bytes decode cache and a mutable lookup map the underlying writer
+ * probes at close time to merge existing FILE-scoped pos-delete files into the new output.
+ * Existing pos-deletes land via {@link #registerExisting} as upstream encounters them.
  *
- * <p>Output file format honors {@code write.delete.format.default} (falling back to the table's
+ * <p>Output file format honors {@code write.delete.format.default} (falling back to
  * {@code write.format.default}, then iceberg's parquet default).
- *
- * <p>Lifecycle: construct → optional {@link #registerExistingPosDeletes} calls → many
- * {@link #delete} calls → {@link #finishAndClose}.
  */
-public final class PerTaskPosDeleteWriter implements AutoCloseable {
+public final class PerTaskPosDeleteWriter implements PerTaskDeleteFileWriter {
 
     private static final long TARGET_FILE_SIZE_BYTES = 512L * 1024 * 1024;
 
@@ -84,12 +76,14 @@ public final class PerTaskPosDeleteWriter implements AutoCloseable {
         this.positionDelete = PositionDelete.create();
     }
 
-    public void registerExistingPosDeletes(String dataFilePath, List<DeleteFile> existing) {
-        if (!existing.isEmpty()) {
-            existingByDataFilePath.put(dataFilePath, existing);
+    @Override
+    public void registerExisting(String dataFilePath, ExistingPerFileDeletes existing) {
+        if (existing instanceof ExistingPerFileDeletes.V2 v2 && !v2.posDeletes().isEmpty()) {
+            existingByDataFilePath.put(dataFilePath, v2.posDeletes());
         }
     }
 
+    @Override
     public void delete(String dataFilePath, long pos, int specId, byte[] partitionBytes) {
         PartitionSpec spec = table.specs().get(specId);
         StructLike partition = partitionCache.computeIfAbsent(
@@ -99,6 +93,7 @@ public final class PerTaskPosDeleteWriter implements AutoCloseable {
         writer.write(positionDelete, spec, partition);
     }
 
+    @Override
     public TaskOutputs finishAndClose() throws IOException {
         close();
         return new TaskOutputs(

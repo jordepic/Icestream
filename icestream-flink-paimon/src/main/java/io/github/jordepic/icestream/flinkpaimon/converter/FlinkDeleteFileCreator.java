@@ -3,12 +3,11 @@ package io.github.jordepic.icestream.flinkpaimon.converter;
 import io.github.jordepic.icestream.converter.CommitPlan;
 import io.github.jordepic.icestream.converter.DeleteConverter;
 import io.github.jordepic.icestream.converter.DeleteFileCreatorSupport;
-import io.github.jordepic.icestream.converter.DeletionVectorLoader;
-import io.github.jordepic.icestream.converter.DvInfo;
 import io.github.jordepic.icestream.converter.EqDeleteWorkItem;
-import io.github.jordepic.icestream.converter.ExistingPosDeleteLoader;
+import io.github.jordepic.icestream.converter.ExistingPerFileDeleteLoader;
 import io.github.jordepic.icestream.converter.PartitionKey;
 import io.github.jordepic.icestream.converter.TaskOutputs;
+import io.github.jordepic.icestream.converter.writers.ExistingPerFileDeletes;
 import io.github.jordepic.icestream.flinkpaimon.flink.FlinkContext;
 import io.github.jordepic.icestream.flinkpaimon.index.IndexTableSchema;
 import io.github.jordepic.icestream.flinkpaimon.index.PaimonIndex;
@@ -24,13 +23,11 @@ import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
-import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.SerializableTable;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -42,10 +39,9 @@ import org.apache.iceberg.types.Types.StructType;
  * <p>Pipeline:
  * <ol>
  *   <li>Build {@link EqDeleteWorkItem}s on the master JVM and pre-collect existing per-data-file
- *       scoped delete files in the touched partitions ({@link DeletionVectorLoader} for V3,
- *       {@link ExistingPosDeleteLoader} for V2). The existing-deletes maps are bounded by the
- *       count of touched data files and are shipped into the per-task operator's serializable
- *       state.
+ *       scoped delete files in the touched partitions via
+ *       {@link ExistingPerFileDeleteLoader#collect}. The map is bounded by the count of touched
+ *       data files and is shipped into the per-task operator's serializable state.
  *   <li>Build a fresh Flink batch env, source the work items, flatMap through
  *       {@link EqDeleteSourceFlatMap} into {@code (spec_id, partition_key, pk)} probe rows.
  *   <li>Convert the probe stream into a Table with a {@code PROCTIME} column, register the
@@ -54,8 +50,8 @@ import org.apache.iceberg.types.Types.StructType;
  *       per-row indexed probes.
  *   <li>Convert the matches Table back to a {@code DataStream<Row>}, key by
  *       {@code data_file_path}, and run {@link WriteDeleteFilesOperator} on TaskManagers — each
- *       TM holds its own {@code PerTaskDvWriter} / {@code PerTaskPosDeleteWriter} for the keys
- *       it owns and emits one {@link TaskOutputs} on end-of-input.
+ *       TM holds its own {@link io.github.jordepic.icestream.converter.writers.PerTaskDeleteFileWriter}
+ *       for the keys it owns and emits one {@link TaskOutputs} on end-of-input.
  *   <li>Collect the {@link TaskOutputs} stream (one record per task slot) on the master JVM and
  *       hand it to {@link DeleteFileCreatorSupport#assemblePlan} for the {@link CommitPlan}.
  * </ol>
@@ -82,16 +78,10 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         List<EqDeleteWorkItem> workItems = DeleteFileCreatorSupport.buildWorkItems(table, run);
         Set<PartitionKey> touchedPartitions = DeleteFileCreatorSupport.touchedPartitions(workItems);
         int formatVersion = DeleteFileCreatorSupport.requireSupportedFormatVersion(table);
+        Map<String, ExistingPerFileDeletes> existingByDataFile =
+                ExistingPerFileDeleteLoader.collect(table, formatVersion, touchedPartitions);
 
-        Map<String, DvInfo> existingDvs = formatVersion == 3
-                ? DeletionVectorLoader.collect(table, touchedPartitions).serializableDeletesByDataFilePath()
-                : Map.of();
-        Map<String, List<DeleteFile>> existingPosDeletes = formatVersion == 2
-                ? ExistingPosDeleteLoader.collect(table, touchedPartitions)
-                : Map.of();
-
-        List<TaskOutputs> taskOutputs =
-                runJob(id, table, workItems, formatVersion, existingDvs, existingPosDeletes);
+        List<TaskOutputs> taskOutputs = runJob(id, table, workItems, formatVersion, existingByDataFile);
         return DeleteFileCreatorSupport.assemblePlan(startingSnapshotId, run, taskOutputs);
     }
 
@@ -100,8 +90,7 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
             Table icebergTable,
             List<EqDeleteWorkItem> workItems,
             int formatVersion,
-            Map<String, DvInfo> existingDvs,
-            Map<String, List<DeleteFile>> existingPosDeletes) {
+            Map<String, ExistingPerFileDeletes> existingByDataFile) {
         StreamExecutionEnvironment env = flink.newBatchEnv();
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         registerPaimonCatalog(tEnv);
@@ -128,11 +117,8 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         DataStream<Row> matches = tEnv.toDataStream(tEnv.sqlQuery(sql));
 
         SerializableTable serializableTable = (SerializableTable) SerializableTable.copyOf(icebergTable);
-        WriteDeleteFilesOperator operator = new WriteDeleteFilesOperator(
-                serializableTable,
-                formatVersion,
-                WriteDeleteFilesOperator.serializableDvMap(existingDvs),
-                WriteDeleteFilesOperator.serializablePosDeleteMap(existingPosDeletes));
+        WriteDeleteFilesOperator operator =
+                new WriteDeleteFilesOperator(serializableTable, formatVersion, existingByDataFile);
 
         DataStream<TaskOutputs> taskOutputsStream = matches
                 .keyBy(row -> (String) row.getField(2))

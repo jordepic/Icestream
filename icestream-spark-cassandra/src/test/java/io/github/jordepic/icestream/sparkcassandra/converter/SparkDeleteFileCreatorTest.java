@@ -62,7 +62,7 @@ import io.github.jordepic.icestream.converter.EqDeleteWorkItem;
 import io.github.jordepic.icestream.converter.PerPositionMatch;
 
 @Testcontainers
-class DeleteFileCreatorTest {
+class SparkDeleteFileCreatorTest {
 
     private static final String KEYSPACE = "icestream_converter_test";
     private static final TableIdentifier TABLE_ID = TableIdentifier.of("db", "t");
@@ -691,7 +691,7 @@ class DeleteFileCreatorTest {
         new SparkDataFileIndexer(spark, index).index(TABLE_ID, table, run, IcestreamTableConfig.from(table));
     }
 
-    /** Local FileWriterFactory adapter — matches WritePosDeleteFiles' inner class but lives in tests. */
+    /** Local FileWriterFactory adapter — matches PerTaskPosDeleteWriter's inner class but lives in tests. */
     private static final class TestPosDeleteWriterFactory implements org.apache.iceberg.io.FileWriterFactory<Record> {
         private final Table table;
         private final FileFormat deleteFormat;

@@ -17,22 +17,11 @@ import org.apache.iceberg.deletes.BaseDVFileWriter;
 import org.apache.iceberg.io.OutputFileFactory;
 
 /**
- * Engine-agnostic V3 per-task writer. Wraps {@link BaseDVFileWriter} with the bookkeeping the
- * upstream callers need:
- * <ul>
- *   <li>A local {@code Map<String, DvInfo>} that {@link DeletionVectorReader} probes when
- *       {@link BaseDVFileWriter#close()} loads previous DVs to merge into the new puffin output.
- *       Callers register existing DVs via {@link #registerExistingDv} before issuing the first
- *       {@link #delete} for that data file.
- *   <li>A {@link PartitionKey} → {@link StructLike} cache so the avro-encoded partition bytes are
- *       decoded once per partition rather than per row.
- * </ul>
- *
- * <p>Both Spark and Flink wrappers create one of these per task and forward {@code (path, pos,
- * specId, partitionBytes)} tuples into {@link #delete}. Lifecycle: construct → optional
- * {@link #registerExistingDv} calls → many {@link #delete} calls → {@link #finishAndClose}.
+ * V3 per-task writer. Wraps {@link BaseDVFileWriter} with a partition-bytes decode cache and a
+ * mutable lookup map the underlying writer probes at close time to merge previous DVs into the
+ * new puffin output. Existing DVs land via {@link #registerExisting} as upstream encounters them.
  */
-public final class PerTaskDvWriter implements AutoCloseable {
+public final class PerTaskDvWriter implements PerTaskDeleteFileWriter {
 
     private final Table table;
     private final BaseDVFileWriter writer;
@@ -51,10 +40,14 @@ public final class PerTaskDvWriter implements AutoCloseable {
         this.partitionCache = new HashMap<>();
     }
 
-    public void registerExistingDv(String dataFilePath, DvInfo dvInfo) {
-        existingByDataFilePath.put(dataFilePath, dvInfo);
+    @Override
+    public void registerExisting(String dataFilePath, ExistingPerFileDeletes existing) {
+        if (existing instanceof ExistingPerFileDeletes.V3 v3) {
+            existingByDataFilePath.put(dataFilePath, v3.dv());
+        }
     }
 
+    @Override
     public void delete(String dataFilePath, long pos, int specId, byte[] partitionBytes) {
         PartitionSpec spec = table.specs().get(specId);
         StructLike partition = partitionCache.computeIfAbsent(
@@ -63,6 +56,7 @@ public final class PerTaskDvWriter implements AutoCloseable {
         writer.delete(dataFilePath, pos, spec, partition);
     }
 
+    @Override
     public TaskOutputs finishAndClose() throws IOException {
         close();
         return new TaskOutputs(
