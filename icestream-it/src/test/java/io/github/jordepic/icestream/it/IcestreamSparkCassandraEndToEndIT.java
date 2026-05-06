@@ -66,9 +66,9 @@ import org.testcontainers.utility.MountableFile;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-class IcestreamEndToEndIT {
+class IcestreamSparkCassandraEndToEndIT {
 
-    private static final Logger log = LoggerFactory.getLogger(IcestreamEndToEndIT.class);
+    private static final Logger log = LoggerFactory.getLogger(IcestreamSparkCassandraEndToEndIT.class);
 
     private static final String S3_BUCKET = "warehouse";
     private static final String AWS_ACCESS_KEY = "minioadmin";
