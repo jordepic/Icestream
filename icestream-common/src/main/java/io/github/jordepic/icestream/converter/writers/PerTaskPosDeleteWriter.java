@@ -79,7 +79,9 @@ public final class PerTaskPosDeleteWriter implements PerTaskDeleteFileWriter {
     @Override
     public void registerExisting(String dataFilePath, ExistingPerFileDeletes existing) {
         if (existing instanceof ExistingPerFileDeletes.V2 v2 && !v2.posDeletes().isEmpty()) {
-            existingByDataFilePath.put(dataFilePath, v2.posDeletes());
+            existingByDataFilePath
+                    .computeIfAbsent(dataFilePath, k -> new java.util.ArrayList<>())
+                    .addAll(v2.posDeletes());
         }
     }
 

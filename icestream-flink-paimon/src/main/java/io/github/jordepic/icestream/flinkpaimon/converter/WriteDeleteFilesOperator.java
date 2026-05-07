@@ -5,46 +5,48 @@ import io.github.jordepic.icestream.converter.writers.ExistingPerFileDeletes;
 import io.github.jordepic.icestream.converter.writers.PerTaskDeleteFileWriter;
 import io.github.jordepic.icestream.converter.writers.PerTaskDeleteFileWriters;
 import io.github.jordepic.icestream.index.IndexEncoding;
-import java.util.Map;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
-import org.apache.flink.streaming.api.operators.BoundedOneInput;
-import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.operators.BoundedMultiInput;
+import org.apache.flink.streaming.api.operators.TwoInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.types.Row;
 import org.apache.iceberg.SerializableTable;
 
 /**
- * Per-task Flink operator that writes per-data-file delete files (V3 puffin DVs or V2 pos-delete
- * files) on TaskManagers — not the master JVM. Wraps a {@link PerTaskDeleteFileWriter} chosen
- * once at {@link #open()}; the V2/V3 difference does not appear in this class.
+ * Two-input per-task operator that writes per-data-file delete files (V3 puffin DVs or V2
+ * pos-delete files) on TaskManagers. Wraps a {@link PerTaskDeleteFileWriter} chosen once at
+ * {@link #open}; the V2/V3 difference does not appear in this class.
  *
- * <p>End-of-input (Flink batch) triggers {@link #endInput} which flushes the writer and emits
- * exactly one {@link TaskOutputs} per task slot to the downstream collect-sink, where the master
- * JVM aggregates them into a {@link io.github.jordepic.icestream.converter.CommitPlan}.
+ * <p>Inputs are co-partitioned by {@code data_file_path} via upstream {@code keyBy(...)} on both
+ * sides, so existing-deletes and matches for the same path always land on the same task slot:
+ * <ul>
+ *   <li>Input 1: {@code (data_file_path, ExistingPerFileDeletes)} — emitted by
+ *       {@link ScanDeleteManifestsFlatMap} as it scans the snapshot's delete manifests.
+ *   <li>Input 2: {@code Row(spec_id, partition_key_hex, data_file_path, pos)} — match rows
+ *       emitted by the Paimon lookup-join.
+ * </ul>
  *
- * <p>Existing per-data-file scoped delete files are pre-collected on the driver via
- * {@link io.github.jordepic.icestream.converter.ExistingPerFileDeleteLoader} and shipped as
- * {@link #existingByDataFile} — replayed once into the writer at {@code open()} so subsequent
- * {@link #processElement} calls only write deletes.
+ * <p>Both inputs are bounded; {@link BoundedMultiInput#endInput(int)} fires once per input.
+ * After both fire, the writer is flushed and a single {@link TaskOutputs} is emitted to the
+ * downstream collect-sink, where the master JVM aggregates them into a {@link
+ * io.github.jordepic.icestream.converter.CommitPlan}.
  */
 public final class WriteDeleteFilesOperator extends AbstractStreamOperator<TaskOutputs>
-        implements OneInputStreamOperator<Row, TaskOutputs>, BoundedOneInput {
+        implements TwoInputStreamOperator<Tuple2<String, ExistingPerFileDeletes>, Row, TaskOutputs>,
+                BoundedMultiInput {
 
     private static final long serialVersionUID = 1L;
 
     private final SerializableTable serializableTable;
     private final int formatVersion;
-    private final Map<String, ExistingPerFileDeletes> existingByDataFile;
 
     private transient PerTaskDeleteFileWriter writer;
+    private transient int finishedInputs;
 
-    public WriteDeleteFilesOperator(
-            SerializableTable serializableTable,
-            int formatVersion,
-            Map<String, ExistingPerFileDeletes> existingByDataFile) {
+    public WriteDeleteFilesOperator(SerializableTable serializableTable, int formatVersion) {
         this.serializableTable = serializableTable;
         this.formatVersion = formatVersion;
-        this.existingByDataFile = existingByDataFile;
     }
 
     @Override
@@ -53,11 +55,16 @@ public final class WriteDeleteFilesOperator extends AbstractStreamOperator<TaskO
         int subtask = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
         long attempt = getRuntimeContext().getTaskInfo().getAttemptNumber();
         writer = PerTaskDeleteFileWriters.forTable(serializableTable, formatVersion, subtask, attempt);
-        existingByDataFile.forEach(writer::registerExisting);
     }
 
     @Override
-    public void processElement(StreamRecord<Row> element) {
+    public void processElement1(StreamRecord<Tuple2<String, ExistingPerFileDeletes>> element) {
+        Tuple2<String, ExistingPerFileDeletes> entry = element.getValue();
+        writer.registerExisting(entry.f0, entry.f1);
+    }
+
+    @Override
+    public void processElement2(StreamRecord<Row> element) {
         Row row = element.getValue();
         int specId = (Integer) row.getField(0);
         byte[] partitionBytes = IndexEncoding.fromHex((String) row.getField(1));
@@ -67,8 +74,11 @@ public final class WriteDeleteFilesOperator extends AbstractStreamOperator<TaskO
     }
 
     @Override
-    public void endInput() throws Exception {
-        output.collect(new StreamRecord<>(writer.finishAndClose()));
+    public void endInput(int inputId) throws Exception {
+        finishedInputs++;
+        if (finishedInputs == 2) {
+            output.collect(new StreamRecord<>(writer.finishAndClose()));
+        }
     }
 
     @Override

@@ -18,8 +18,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -28,6 +30,7 @@ import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
+import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.SerializableTable;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -38,20 +41,26 @@ import org.apache.iceberg.types.Types.StructType;
  *
  * <p>Pipeline:
  * <ol>
- *   <li>Build {@link EqDeleteWorkItem}s on the master JVM and pre-collect existing per-data-file
- *       scoped delete files in the touched partitions via
- *       {@link ExistingPerFileDeleteLoader#collect}. The map is bounded by the count of touched
- *       data files and is shipped into the per-task operator's serializable state.
- *   <li>Build a fresh Flink batch env, source the work items, flatMap through
- *       {@link EqDeleteSourceFlatMap} into {@code (spec_id, partition_key, pk)} probe rows.
- *   <li>Convert the probe stream into a Table with a {@code PROCTIME} column, register the
- *       Paimon catalog, and run a SQL {@code LEFT JOIN ... FOR SYSTEM_TIME AS OF} against the
- *       index table — Flink's planner picks Paimon's {@code FileStoreLookupFunction}, giving
- *       per-row indexed probes.
- *   <li>Convert the matches Table back to a {@code DataStream<Row>}, key by
- *       {@code data_file_path}, and run {@link WriteDeleteFilesOperator} on TaskManagers — each
- *       TM holds its own {@link io.github.jordepic.icestream.converter.writers.PerTaskDeleteFileWriter}
- *       for the keys it owns and emits one {@link TaskOutputs} on end-of-input.
+ *   <li>Build {@link EqDeleteWorkItem}s on the master JVM, derive {@code touchedPartitions}, and
+ *       enumerate the snapshot's delete-manifest references via
+ *       {@link ExistingPerFileDeleteLoader#deleteManifests}. Manifest <em>scan</em> is deferred to
+ *       per-task work via {@link ScanDeleteManifestsFlatMap} so the master JVM only does cheap
+ *       metadata reads.
+ *   <li>Build a fresh Flink batch env with two parallel sources:
+ *       <ul>
+ *         <li>Eq-delete work items → {@link EqDeleteSourceFlatMap} → probe rows
+ *             {@code (spec_id, partition_key, pk)} → registered as a temporary view → SQL
+ *             {@code LEFT JOIN ... FOR SYSTEM_TIME AS OF} drives the Paimon lookup join, giving
+ *             per-row indexed probes via {@code FileStoreLookupFunction}. Match rows carry
+ *             {@code (spec_id, partition_key, data_file_path, pos)}.
+ *         <li>Delete manifests → {@link ScanDeleteManifestsFlatMap} → existing-deletes tuples
+ *             {@code (data_file_path, ExistingPerFileDeletes)}.
+ *       </ul>
+ *   <li>Both streams {@code keyBy(data_file_path)}-ed, {@link DataStream#connect} into a two-input
+ *       {@link WriteDeleteFilesOperator}. Each task slot owns one
+ *       {@link io.github.jordepic.icestream.converter.writers.PerTaskDeleteFileWriter} for the
+ *       data files keyed to it; existing-deletes and matches for the same path are
+ *       co-partitioned, so registration and writes always land on the same writer.
  *   <li>Collect the {@link TaskOutputs} stream (one record per task slot) on the master JVM and
  *       hand it to {@link DeleteFileCreatorSupport#assemblePlan} for the {@link CommitPlan}.
  * </ol>
@@ -78,10 +87,10 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         List<EqDeleteWorkItem> workItems = DeleteFileCreatorSupport.buildWorkItems(table, run);
         Set<PartitionKey> touchedPartitions = DeleteFileCreatorSupport.touchedPartitions(workItems);
         int formatVersion = DeleteFileCreatorSupport.requireSupportedFormatVersion(table);
-        Map<String, ExistingPerFileDeletes> existingByDataFile =
-                ExistingPerFileDeleteLoader.collect(table, formatVersion, touchedPartitions);
+        List<ManifestFile> deleteManifests = ExistingPerFileDeleteLoader.deleteManifests(table);
 
-        List<TaskOutputs> taskOutputs = runJob(id, table, workItems, formatVersion, existingByDataFile);
+        List<TaskOutputs> taskOutputs =
+                runJob(id, table, workItems, formatVersion, touchedPartitions, deleteManifests);
         return DeleteFileCreatorSupport.assemblePlan(startingSnapshotId, run, taskOutputs);
     }
 
@@ -90,7 +99,8 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
             Table icebergTable,
             List<EqDeleteWorkItem> workItems,
             int formatVersion,
-            Map<String, ExistingPerFileDeletes> existingByDataFile) {
+            Set<PartitionKey> touchedPartitions,
+            List<ManifestFile> deleteManifests) {
         StreamExecutionEnvironment env = flink.newBatchEnv();
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         registerPaimonCatalog(tEnv);
@@ -116,12 +126,19 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
         String sql = buildLookupJoinSql(qualifiedIndexFqn(id));
         DataStream<Row> matches = tEnv.toDataStream(tEnv.sqlQuery(sql));
 
-        SerializableTable serializableTable = (SerializableTable) SerializableTable.copyOf(icebergTable);
-        WriteDeleteFilesOperator operator =
-                new WriteDeleteFilesOperator(serializableTable, formatVersion, existingByDataFile);
+        TypeInformation<Tuple2<String, ExistingPerFileDeletes>> existingTypeInfo =
+                TypeInformation.of(new TypeHint<>() {});
+        DataStream<Tuple2<String, ExistingPerFileDeletes>> existingDeletes = env.fromCollection(
+                        deleteManifests, TypeInformation.of(ManifestFile.class))
+                .flatMap(new ScanDeleteManifestsFlatMap(icebergTable, formatVersion, touchedPartitions))
+                .returns(existingTypeInfo);
 
-        DataStream<TaskOutputs> taskOutputsStream = matches
-                .keyBy(row -> (String) row.getField(2))
+        SerializableTable serializableTable = (SerializableTable) SerializableTable.copyOf(icebergTable);
+        WriteDeleteFilesOperator operator = new WriteDeleteFilesOperator(serializableTable, formatVersion);
+
+        DataStream<TaskOutputs> taskOutputsStream = existingDeletes
+                .keyBy(entry -> entry.f0)
+                .connect(matches.keyBy(row -> (String) row.getField(2)))
                 .transform("WriteDeleteFiles", TypeInformation.of(TaskOutputs.class), operator);
 
         List<TaskOutputs> collected = new ArrayList<>();
