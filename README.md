@@ -209,8 +209,7 @@ the same avro `StructLike` byte representation, computed in
 
 ## Architectural decisions
 
-These are the load-bearing choices the codebase commits to. Most live in
-`.claude/flink_paimon_port_plan.md` with longer reasoning; quick summary:
+These are the load-bearing choices the codebase commits to.
 
 1. **Multi-impl module split.** `icestream-common` holds engine-agnostic
    logic (planner, schema, master loop, iceberg readers, conversion
@@ -356,53 +355,15 @@ These are deliberate v1 simplifications, not permanent constraints.
 
 - `icestream-common` — engine-agnostic core; tested via the backend modules
   that depend on it.
-- `icestream-spark-cassandra` — 86 unit tests (testcontainers Cassandra +
-  in-process Spark).
-- `icestream-flink-paimon` — 7 unit tests (in-process Paimon FilesystemCatalog
-  + Flink `MiniCluster`); includes `lookupJoinPlanUsesPaimonFileStoreLookupFunction`
-  asserting Flink's planner picks `LookupJoin` (not a fallback hash join).
+- `icestream-spark-cassandra` — unit tests run against a testcontainers
+  Cassandra and an in-process Spark.
+- `icestream-flink-paimon` — unit tests run in-process against Paimon's
+  filesystem catalog and a Flink `MiniCluster`; includes
+  `lookupJoinPlanUsesPaimonFileStoreLookupFunction` asserting Flink's planner
+  picks `LookupJoin` (not a fallback hash join).
 - `icestream-it` — two end-to-end docker-compose ITs:
   `IcestreamSparkCassandraEndToEndIT` and `IcestreamFlinkPaimonEndToEndIT`,
   each running Kafka + Flink upsert ingestion + the corresponding backend
   for ~60 s and asserting that every snapshot tagged
   `icestream-converted=true` has the same visible row set as its parent.
 
-## Module layout
-
-```
-icestream-common/                  pure logic + interfaces
-  planner/                         SnapshotPlanner, FileRun, *Run, FileKind, State
-  schema/                          IcestreamProperties, IcestreamTableConfig, PrimaryKeySchema
-  indexer/                         DataFileReader, DataIndexer, FileWorkItem
-  converter/                       ConversionCommitter, CommitPlan, TaskOutputs,
-                                   PerPositionMatch, EqDeleteWorkItem, DvInfo,
-                                   DeletionVectorReader, DeletionVectorLoader,
-                                   ExistingPosDeleteLoader, DeleteConverter,
-                                   DeleteFileCreatorSupport,
-                                   writers/PerTaskDvWriter, writers/PerTaskPosDeleteWriter
-  master/                          MasterLoop, TableProcessor, RunProcessor,
-                                   IcestreamMetrics, EnvConfig, LifecycleHooks
-  index/                           IndexEncoding, IndexBackend
-
-icestream-spark-cassandra/         spark-on-k8s + Cassandra backend
-  cassandra/CassandraIndex, SaltBucket, IndexRow, ...
-  indexer/SparkDataFileIndexer
-  converter/SparkDeleteFileCreator, Spark{Dv,PosDelete}FileStrategy,
-            WriteDvFiles, WritePosDeleteFiles, SparkEqDeleteReader
-  master/SparkMain
-  helm/                            Spark driver-pod chart
-
-icestream-flink-paimon/            flink-on-k8s + Paimon backend
-  index/PaimonIndex, IndexTableSchema, PaimonCatalogFactory
-  flink/FlinkContext
-  indexer/FlinkDataFileIndexer, DataFileFlatMap
-  converter/FlinkDeleteFileCreator, EqDeleteSourceFlatMap,
-            WriteDeleteFilesOperator
-  master/FlinkMain
-  helm/                            FlinkDeployment + master Deployment chart
-
-icestream-it/                      end-to-end docker-compose ITs
-  IcestreamSparkCassandraEndToEndIT
-  IcestreamFlinkPaimonEndToEndIT
-  KafkaJsonProducer
-```
