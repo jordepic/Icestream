@@ -1,7 +1,5 @@
-replicaCount: 1
-
 image:
-  repository: icestream/icestream-flink-paimon-master
+  repository: icestream/icestream-flink-paimon
   tag: ""
   pullPolicy: IfNotPresent
 
@@ -9,14 +7,21 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# In-cluster endpoints, plain values (no Secret) per the v1 deployment story.
+# Flink execution mode for the single icestream process (one pod runs the polling control loop AND
+# owns the converter that drives the Flink job — there is no separate "worker" pod, no RPC hop):
+#   remote — production. Submits ONE standing streaming converter job to the Flink session cluster
+#            (managed below by flinkSessionCluster) and hosts the conversion channel server the
+#            cluster's TaskManagers dial back into for lookup work-in/results-out. All file reads and
+#            writes run distributed on the cluster; only the commit is centralized in this pod.
+#   local  — dev/small. Runs the converter on an in-pod MiniCluster (in-process channel, no session
+#            cluster, no channel server). Size the pod for the in-pod Flink (Paimon lookup) work.
+flinkMode: remote
+
 appConfig:
   iceberg:
     restUri: http://iceberg-rest:8181
     warehouse: s3://warehouse/
-    # Free-form additional iceberg catalog options. Each entry is converted into
-    # an env var ICESTREAM_ICEBERG_OPT_<KEY> on the master pod, which Main parses
-    # back into the catalog props map.
+    # Free-form iceberg catalog options → env vars ICESTREAM_ICEBERG_OPT_<KEY> (key: upper, . / - → _).
     extraOptions: {}
       # s3.endpoint: http://minio:9000
       # s3.path-style-access: "true"
@@ -24,30 +29,49 @@ appConfig:
   paimon:
     warehouse: s3://warehouse/paimon/
     database: icestream
-    # Free-form Paimon catalog options. Each entry becomes ICESTREAM_PAIMON_OPT_<KEY>.
+    # Free-form Paimon catalog options → ICESTREAM_PAIMON_OPT_<KEY>.
     extraOptions: {}
-      # metastore: filesystem
       # s3.endpoint: http://minio:9000
       # s3.access-key: minio-user
       # s3.secret-key: minio-pass
   flink:
-    # mode: "remote" submits to a long-lived session cluster (the FlinkDeployment
-    # CR below); "local" runs an in-pod MiniCluster (sized small for dev only).
-    mode: remote
     parallelism: 4
-    # When mode=remote, points at the JM service the FlinkDeployment owns. By
-    # default this is the in-cluster name flink-kubernetes-operator gives the JM.
+    # The operator-managed JM service the icestream pod submits the standing job to (flinkMode=remote).
     sessionCluster:
       name: icestream-flink-session
       jmHost: icestream-flink-session-rest
       jmPort: 8081
   icestream:
+    # streaming = one long-lived warm job (production). batch = a fresh job per conversion (testing).
+    converter: streaming
     pollIntervalSeconds: 10
     idleBackoffSeconds: 60
     maxConcurrentTasks: 4
+    streamingCheckpointMs: 2000
+    conversionTimeoutMs: 600000
 
-# Long-lived Flink session cluster managed by flink-kubernetes-operator. Set
-# .enabled=false if you want to point at a pre-existing FlinkDeployment.
+# Conversion channel server (flinkMode=remote only): the session cluster's TaskManagers dial back
+# here for the lookup work-in/results-out channel. Exposed as an in-cluster Service at the advertised
+# URL (the channel Service DNS).
+channel:
+  port: 8090
+  # Path inside the image to the shaded job jar shipped to the session-cluster TaskManagers
+  # (ICESTREAM_FLINK_JARS). Built by the cluster-jar maven profile and copied into the jib image.
+  flinkJars: /app/job/icestream-cluster.jar
+
+# The single icestream pod. In flinkMode=remote the heavy compute lives on the session cluster, so
+# this can be modest; in flinkMode=local size it for the in-pod Flink (Paimon lookup) work.
+resources:
+  requests:
+    cpu: "1"
+    memory: 2Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+
+# Long-lived Flink session cluster managed by flink-kubernetes-operator (flinkMode=remote only). Set
+# enabled=false to point the icestream pod at a pre-existing FlinkDeployment (configure
+# appConfig.flink.sessionCluster).
 flinkSessionCluster:
   enabled: true
   flinkVersion: v2_0
@@ -62,22 +86,17 @@ flinkSessionCluster:
       cpu: 2
       memory: 4096m
     replicas: 2
-    numberOfTaskSlots: 2
   flinkConfiguration:
     taskmanager.numberOfTaskSlots: "2"
+    # The shaded user jar loads many classes per job submission; bump metaspace so a long-lived
+    # session cluster doesn't OOM Metaspace after several submissions.
+    taskmanager.memory.jvm-metaspace.size: "1024m"
     state.savepoints.dir: "file:///flink-data/savepoints"
     state.checkpoints.dir: "file:///flink-data/checkpoints"
 
-masterResources:
-  requests:
-    cpu: 500m
-    memory: 1Gi
-  limits:
-    cpu: 1
-    memory: 2Gi
-
 serviceAccount:
   create: true
+  name: ""
   annotations: {}
   automountServiceAccountToken: true
 

@@ -94,6 +94,26 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- The conversion benchmark reads the Paimon index table through Flink's source API:
+             Paimon's FileStoreSourceReader needs flink-connector-base
+             (SingleThreadMultiplexSourceReaderBase) and flink-connector-files
+             (BulkFormat$RecordIterator). flink-paimon's own tests get these transitively via
+             test-scoped flink-test-utils, which does not reach this module. Declare them directly
+             and narrowly — pulling the full flink-test-utils umbrella drags in an unshaded Kryo
+             that clashes with Spark's Kryo (Spark is on this module's classpath for the other IT). -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-base</artifactId>
+            <version>${flink.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-files</artifactId>
+            <version>${flink.version}</version>
+            <scope>test</scope>
+        </dependency>
+
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
@@ -246,4 +266,47 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+          Run the in-process Flink+Paimon conversion benchmark on demand (it is NOT part of the
+          default build, which only runs *IT.java). Example:
+            mvn -pl icestream-it -am test -Pbenchmark \
+                -Dbench.rows=25000000 -Dbench.files=48 -Dbench.ratio=100
+          Knobs: bench.rows, bench.files, bench.ratio, bench.buckets, bench.slots,
+                 bench.convertRepeats, bench.nameWidth, bench.formatVersion, bench.seed.
+        -->
+        <profile>
+            <id>benchmark</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <includes combine.children="override">
+                                <include>**/ConversionBenchmark.java</include>
+                            </includes>
+                            <argLine>
+                                -Xmx16g
+                                --add-opens=java.base/java.lang=ALL-UNNAMED
+                                --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+                                --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+                                --add-opens=java.base/java.io=ALL-UNNAMED
+                                --add-opens=java.base/java.net=ALL-UNNAMED
+                                --add-opens=java.base/java.nio=ALL-UNNAMED
+                                --add-opens=java.base/java.util=ALL-UNNAMED
+                                --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+                                --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+                                --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+                                --add-opens=java.base/sun.nio.cs=ALL-UNNAMED
+                                --add-opens=java.base/sun.security.action=ALL-UNNAMED
+                                --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+                            </argLine>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

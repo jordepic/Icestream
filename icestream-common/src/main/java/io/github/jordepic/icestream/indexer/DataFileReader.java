@@ -48,6 +48,19 @@ public final class DataFileReader {
                 all, record -> !deletes.isDeleted((Long) record.getField(MetadataColumns.ROW_POSITION.name())));
     }
 
+    /**
+     * Reads the rows of an equality-delete file as {@link Record}s, projected to {@code projection}
+     * (the primary-key schema). Format-agnostic, same dispatch as {@link #read}. Unlike
+     * {@code BaseDeleteLoader.loadEqualityDeletes} this does <b>not</b> materialize a deduplicating
+     * {@code StructLikeSet} — it streams rows straight through. Duplicate keys are harmless: each
+     * resolves to the same {@code (data_file, pos)} and the iceberg positional-delete / DV writers
+     * collapse repeats into one RoaringBitmap bit.
+     */
+    public static CloseableIterable<Record> readEqualityDeletes(
+            FileIO io, DeleteFile deleteFile, Schema projection) {
+        return openForFormat(deleteFile.format(), io.newInputFile(deleteFile.location()), projection);
+    }
+
     private static CloseableIterable<Record> openForFormat(FileFormat format, InputFile in, Schema projection) {
         return switch (format) {
             case PARQUET -> Parquet.read(in)

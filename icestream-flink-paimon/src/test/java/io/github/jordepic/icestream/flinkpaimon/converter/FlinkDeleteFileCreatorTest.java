@@ -260,7 +260,7 @@ class FlinkDeleteFileCreatorTest {
             org.apache.flink.streaming.api.environment.StreamExecutionEnvironment env = ctx.newBatchEnv();
             org.apache.flink.table.api.bridge.java.StreamTableEnvironment tEnv =
                     org.apache.flink.table.api.bridge.java.StreamTableEnvironment.create(env);
-            registerPaimonCatalogForTest(tEnv);
+            PaimonLookupJoin.registerCatalog(tEnv, paimonIndex);
 
             org.apache.flink.streaming.api.datastream.DataStream<org.apache.flink.types.Row> empty =
                     env.fromCollection(List.<org.apache.flink.types.Row>of(),
@@ -279,8 +279,7 @@ class FlinkDeleteFileCreatorTest {
                     .build();
             tEnv.createTemporaryView("icestream_eq_deletes", tEnv.fromDataStream(empty, probeSchema));
 
-            FlinkDeleteFileCreator creator = new FlinkDeleteFileCreator(ctx, paimonIndex);
-            String sql = FlinkDeleteFileCreator.buildLookupJoinSql(creator.qualifiedIndexFqn(id));
+            String sql = LookupJoinSql.lookupJoin(PaimonLookupJoin.indexFqn(paimonIndex, id));
             String plan = tEnv.sqlQuery(sql).explain();
 
             assertThat(plan)
@@ -291,13 +290,6 @@ class FlinkDeleteFileCreatorTest {
                             plan)
                     .contains("LookupJoin");
         }
-    }
-
-    private void registerPaimonCatalogForTest(org.apache.flink.table.api.bridge.java.StreamTableEnvironment tEnv) {
-        StringBuilder withClause = new StringBuilder("'type'='paimon'");
-        paimonIndex.catalogOptionsForFlink().forEach((k, v) ->
-                withClause.append(",'").append(k).append("'='").append(v).append("'"));
-        tEnv.executeSql("CREATE CATALOG paimon WITH (" + withClause + ")");
     }
 
     @Test

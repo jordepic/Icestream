@@ -1,0 +1,110 @@
+# The single icestream process: the master control loop (poll → plan → index → convert → commit →
+# watermark) plus, in the same JVM, the converter that drives the Flink job. There is no separate
+# "worker" pod and no master↔worker RPC.
+#
+#   flinkMode=remote — submits ONE standing streaming converter job to the session cluster
+#                      (FLINK_MODE=remote) and hosts the conversion channel server the cluster's
+#                      TaskManagers dial back into for lookup work-in/results-out. The advertised URL
+#                      must be the in-cluster Service DNS (set below from the channel Service name),
+#                      since the TaskManagers reach this pod through it.
+#   flinkMode=local  — runs the converter on an in-pod MiniCluster (in-process channel, no session
+#                      cluster, no channel server). For dev / small tables.
+{{- $remote := eq .Values.flinkMode "remote" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "icestream.fullname" . }}
+  labels:
+    {{- include "icestream.labels" . | nindent 4 }}
+    app.kubernetes.io/component: icestream
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "icestream.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: icestream
+  template:
+    metadata:
+      labels:
+        {{- include "icestream.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: icestream
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "icestream.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: icestream
+          image: {{ include "icestream.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if $remote }}
+          ports:
+            - name: channel
+              containerPort: {{ .Values.channel.port }}
+          {{- end }}
+          env:
+            {{- include "icestream.catalogEnv" . | nindent 12 }}
+            - name: ICESTREAM_FLINK_MODE
+              value: {{ .Values.flinkMode | quote }}
+            - name: ICESTREAM_FLINK_PARALLELISM
+              value: {{ .Values.appConfig.flink.parallelism | quote }}
+            {{- if $remote }}
+            - name: ICESTREAM_FLINK_JM_HOST
+              value: {{ .Values.appConfig.flink.sessionCluster.jmHost | quote }}
+            - name: ICESTREAM_FLINK_JM_PORT
+              value: {{ .Values.appConfig.flink.sessionCluster.jmPort | quote }}
+            - name: ICESTREAM_FLINK_JARS
+              value: {{ .Values.channel.flinkJars | quote }}
+            - name: ICESTREAM_CHANNEL_PORT
+              value: {{ .Values.channel.port | quote }}
+            # Host the session cluster's TaskManagers use to reach this pod's channel server (the
+            # channel Service DNS); the converter binds ICESTREAM_CHANNEL_PORT and advertises this host.
+            - name: ICESTREAM_CHANNEL_ADVERTISED_HOST
+              value: {{ include "icestream.channelServiceName" . | quote }}
+            {{- end }}
+            - name: ICESTREAM_CONVERTER
+              value: {{ .Values.appConfig.icestream.converter | quote }}
+            - name: ICESTREAM_STREAMING_CHECKPOINT_MS
+              value: {{ .Values.appConfig.icestream.streamingCheckpointMs | quote }}
+            - name: ICESTREAM_CONVERSION_TIMEOUT_MS
+              value: {{ .Values.appConfig.icestream.conversionTimeoutMs | quote }}
+            - name: ICESTREAM_POLL_INTERVAL_SECONDS
+              value: {{ .Values.appConfig.icestream.pollIntervalSeconds | quote }}
+            - name: ICESTREAM_IDLE_BACKOFF_SECONDS
+              value: {{ .Values.appConfig.icestream.idleBackoffSeconds | quote }}
+            - name: ICESTREAM_MAX_CONCURRENT_TASKS
+              value: {{ .Values.appConfig.icestream.maxConcurrentTasks | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+{{- if $remote }}
+---
+# In-cluster Service the session cluster's TaskManagers dial back to for the conversion channel.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "icestream.channelServiceName" . }}
+  labels:
+    {{- include "icestream.labels" . | nindent 4 }}
+    app.kubernetes.io/component: icestream
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "icestream.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: icestream
+  ports:
+    - name: channel
+      port: {{ .Values.channel.port }}
+      targetPort: channel
+{{- end -}}

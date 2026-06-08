@@ -21,25 +21,65 @@ public final class IndexEncoding {
 
     private IndexEncoding() {}
 
+    private static final byte[] EMPTY = new byte[0];
+
+    /**
+     * One-shot encode of a {@link StructLike} to avro bytes. Convenient but allocation-heavy: it
+     * rebuilds the avro schema, datum writer, and scratch record on every call. For hot per-row
+     * loops (the indexer and the eq-delete probe reader) use a reusable {@link AvroByteEncoder}
+     * instead — its output is byte-identical.
+     */
     public static byte[] encodeAsAvroBytes(Types.StructType type, StructLike value) {
-        List<NestedField> fields = type.fields();
-        if (fields.isEmpty()) {
-            return new byte[0];
+        return new AvroByteEncoder(type).encode(value);
+    }
+
+    /**
+     * Reusable, single-threaded {@code StructLike → avro bytes} encoder. Hoists everything
+     * {@link #encodeAsAvroBytes} rebuilds per call — the avro schema, the {@link GenericDatumWriter},
+     * the {@link InternalRecordWrapper}/{@link PartitionData} scratch, and the output buffer/encoder
+     * — so a per-row loop allocates almost nothing and never re-derives the schema (the
+     * {@code PartitionData}/Avro-schema construction that dominated the convert profile). Output is
+     * byte-identical to {@link #encodeAsAvroBytes}. <b>Not thread-safe</b> — one per operator subtask.
+     */
+    public static final class AvroByteEncoder {
+
+        private final List<NestedField> fields;
+        private final Class<?>[] javaClasses;
+        private final InternalRecordWrapper wrapper;
+        private final PartitionData record;
+        private final GenericDatumWriter<IndexedRecord> writer;
+        private final ByteArrayOutputStream out = new ByteArrayOutputStream();
+        private BinaryEncoder encoder;
+
+        public AvroByteEncoder(Types.StructType type) {
+            this.fields = type.fields();
+            this.wrapper = new InternalRecordWrapper(type);
+            this.record = new PartitionData(type);
+            this.writer = new GenericDatumWriter<>(record.getSchema());
+            this.javaClasses = new Class<?>[fields.size()];
+            for (int i = 0; i < fields.size(); i++) {
+                javaClasses[i] = fields.get(i).type().typeId().javaClass();
+            }
         }
-        PartitionData record = new PartitionData(type);
-        StructLike internal = new InternalRecordWrapper(type).wrap(value);
-        for (int i = 0; i < fields.size(); i++) {
-            record.set(i, internal.get(i, fields.get(i).type().typeId().javaClass()));
+
+        public byte[] encode(StructLike value) {
+            if (fields.isEmpty()) {
+                return EMPTY;
+            }
+            StructLike internal = wrapper.wrap(value);
+            for (int i = 0; i < fields.size(); i++) {
+                record.set(i, internal.get(i, javaClasses[i]));
+            }
+            out.reset();
+            encoder = EncoderFactory.get().binaryEncoder(out, encoder);
+            try {
+                writer.write(record, encoder);
+                encoder.flush();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+            return out.toByteArray();
         }
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        BinaryEncoder encoder = EncoderFactory.get().binaryEncoder(out, null);
-        try {
-            new GenericDatumWriter<IndexedRecord>(record.getSchema()).write(record, encoder);
-            encoder.flush();
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-        return out.toByteArray();
     }
 
     /**

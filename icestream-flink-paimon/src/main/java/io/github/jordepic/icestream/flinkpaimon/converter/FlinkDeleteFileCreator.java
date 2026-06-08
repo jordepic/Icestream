@@ -9,24 +9,17 @@ import io.github.jordepic.icestream.converter.PartitionKey;
 import io.github.jordepic.icestream.converter.TaskOutputs;
 import io.github.jordepic.icestream.converter.writers.ExistingPerFileDeletes;
 import io.github.jordepic.icestream.flinkpaimon.flink.FlinkContext;
-import io.github.jordepic.icestream.flinkpaimon.index.IndexTableSchema;
 import io.github.jordepic.icestream.flinkpaimon.index.PaimonIndex;
 import io.github.jordepic.icestream.planner.EqualityDeleteFileRun;
 import io.github.jordepic.icestream.schema.IcestreamTableConfig;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.table.api.DataTypes;
-import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
@@ -37,7 +30,8 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.types.Types.StructType;
 
 /**
- * Flink + Paimon implementation of {@link DeleteConverter}.
+ * Batch Flink + Paimon {@link DeleteConverter}: a fresh batch job per conversion (the reference /
+ * benchmark-control implementation; production uses {@link StreamingFlinkDeleteFileCreator}).
  *
  * <p>Pipeline:
  * <ol>
@@ -46,36 +40,37 @@ import org.apache.iceberg.types.Types.StructType;
  *       {@link ExistingPerFileDeleteLoader#deleteManifests}. Manifest <em>scan</em> is deferred to
  *       per-task work via {@link ScanDeleteManifestsFlatMap} so the master JVM only does cheap
  *       metadata reads.
- *   <li>Build a fresh Flink batch env with two parallel sources:
- *       <ul>
- *         <li>Eq-delete work items → {@link EqDeleteSourceFlatMap} → probe rows
- *             {@code (spec_id, partition_key, pk)} → registered as a temporary view → SQL
- *             {@code LEFT JOIN ... FOR SYSTEM_TIME AS OF} drives the Paimon lookup join, giving
- *             per-row indexed probes via {@code FileStoreLookupFunction}. Match rows carry
- *             {@code (spec_id, partition_key, data_file_path, pos)}.
- *         <li>Delete manifests → {@link ScanDeleteManifestsFlatMap} → existing-deletes tuples
- *             {@code (data_file_path, ExistingPerFileDeletes)}.
- *       </ul>
+ *   <li>Build a fresh Flink batch env with two parallel sources: eq-delete work items →
+ *       {@link EqDeleteSourceFlatMap} → probe rows → {@link PaimonLookupJoin} match rows
+ *       {@code (spec_id, partition_key, data_file_path, pos)}; and delete manifests →
+ *       {@link ScanDeleteManifestsFlatMap} → existing-deletes tuples.
  *   <li>Both streams {@code keyBy(data_file_path)}-ed, {@link DataStream#connect} into a two-input
- *       {@link WriteDeleteFilesOperator}. Each task slot owns one
- *       {@link io.github.jordepic.icestream.converter.writers.PerTaskDeleteFileWriter} for the
- *       data files keyed to it; existing-deletes and matches for the same path are
- *       co-partitioned, so registration and writes always land on the same writer.
- *   <li>Collect the {@link TaskOutputs} stream (one record per task slot) on the master JVM and
- *       hand it to {@link DeleteFileCreatorSupport#assemblePlan} for the {@link CommitPlan}.
+ *       {@link WriteDeleteFilesOperator}, so existing-deletes and matches for the same path land on
+ *       the same writer.
+ *   <li>Collect the {@link TaskOutputs} on the master JVM and hand it to
+ *       {@link DeleteFileCreatorSupport#assemblePlan} for the {@link CommitPlan}.
  * </ol>
  */
 public final class FlinkDeleteFileCreator implements DeleteConverter {
 
-    private static final String PAIMON_CATALOG_NAME = "paimon";
-    private static final String EQ_DELETES_VIEW = "icestream_eq_deletes";
-
     private final FlinkContext flink;
     private final PaimonIndex paimonIndex;
+    private final boolean useLookupJoin;
 
     public FlinkDeleteFileCreator(FlinkContext flink, PaimonIndex paimonIndex) {
+        this(flink, paimonIndex, true);
+    }
+
+    /**
+     * @param useLookupJoin when {@code true} (the default) the probe is driven by a
+     *     {@code FOR SYSTEM_TIME AS OF} temporal join → Paimon's {@code FileStoreLookupFunction}
+     *     (indexed point lookups). {@code false} drops the hint for a full-scan regular join — a
+     *     benchmark control to isolate the indexed-lookup win; never used in production.
+     */
+    public FlinkDeleteFileCreator(FlinkContext flink, PaimonIndex paimonIndex, boolean useLookupJoin) {
         this.flink = flink;
         this.paimonIndex = paimonIndex;
+        this.useLookupJoin = useLookupJoin;
     }
 
     @Override
@@ -103,28 +98,16 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
             List<ManifestFile> deleteManifests) {
         StreamExecutionEnvironment env = flink.newBatchEnv();
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
-        registerPaimonCatalog(tEnv);
+        PaimonLookupJoin.registerCatalog(tEnv, paimonIndex);
 
-        org.apache.iceberg.Schema pkSchema = new org.apache.iceberg.Schema(buildPkFields(icebergTable));
-        StructType pkStruct = StructType.of(buildPkFields(icebergTable));
+        var pkFields = PaimonLookupJoin.pkFields(icebergTable);
+        org.apache.iceberg.Schema pkSchema = new org.apache.iceberg.Schema(pkFields);
+        StructType pkStruct = StructType.of(pkFields);
 
-        TypeInformation<Row> probeTypeInfo = new RowTypeInfo(
-                new TypeInformation[] {Types.INT, Types.STRING, Types.STRING},
-                new String[] {"spec_id", "partition_key", "pk"});
         DataStream<Row> probes = env.fromCollection(workItems, TypeInformation.of(EqDeleteWorkItem.class))
                 .flatMap(new EqDeleteSourceFlatMap(icebergTable, pkSchema, pkStruct))
-                .returns(probeTypeInfo);
-
-        Schema probeSchema = Schema.newBuilder()
-                .column("spec_id", DataTypes.INT())
-                .column("partition_key", DataTypes.STRING())
-                .column("pk", DataTypes.STRING())
-                .columnByExpression("proc", "PROCTIME()")
-                .build();
-        tEnv.createTemporaryView(EQ_DELETES_VIEW, tEnv.fromDataStream(probes, probeSchema));
-
-        String sql = buildLookupJoinSql(qualifiedIndexFqn(id));
-        DataStream<Row> matches = tEnv.toDataStream(tEnv.sqlQuery(sql));
+                .returns(PaimonLookupJoin.PROBE_TYPE_INFO);
+        DataStream<Row> matches = PaimonLookupJoin.lookupMatches(tEnv, probes, paimonIndex, id, useLookupJoin);
 
         TypeInformation<Tuple2<String, ExistingPerFileDeletes>> existingTypeInfo =
                 TypeInformation.of(new TypeHint<>() {});
@@ -150,45 +133,5 @@ public final class FlinkDeleteFileCreator implements DeleteConverter {
             throw new RuntimeException("Flink converter job failed for " + id, e);
         }
         return collected;
-    }
-
-    /**
-     * SQL the converter runs against its temporary view to drive the lookup join. Package-private
-     * so tests can call {@code tEnv.sqlQuery(...).explain()} on this and assert the planner
-     * picked Paimon's {@code FileStoreLookupFunction} (a {@code LookupJoin} operator) rather
-     * than a regular hash/sort-merge join — which would silently lose the indexed-probe semantics
-     * that are the whole point of moving from Spark+Cassandra to Flink+Paimon.
-     */
-    static String buildLookupJoinSql(String indexFqn) {
-        return "SELECT eq.spec_id, eq.partition_key, idx." + IndexTableSchema.COL_DATA_FILE_PATH
-                + ", idx." + IndexTableSchema.COL_POS
-                + " FROM " + EQ_DELETES_VIEW + " AS eq"
-                + " LEFT JOIN " + indexFqn + " FOR SYSTEM_TIME AS OF eq.proc AS idx"
-                + " ON eq." + IndexTableSchema.COL_SPEC_ID + " = idx." + IndexTableSchema.COL_SPEC_ID
-                + " AND eq." + IndexTableSchema.COL_PARTITION_KEY + " = idx." + IndexTableSchema.COL_PARTITION_KEY
-                + " AND eq." + IndexTableSchema.COL_PK + " = idx." + IndexTableSchema.COL_PK
-                + " WHERE idx." + IndexTableSchema.COL_DATA_FILE_PATH + " IS NOT NULL";
-    }
-
-    String qualifiedIndexFqn(TableIdentifier id) {
-        return String.format(
-                "`%s`.`%s`.`%s`",
-                PAIMON_CATALOG_NAME, paimonIndex.database(), paimonIndex.tableName(id));
-    }
-
-    private void registerPaimonCatalog(StreamTableEnvironment tEnv) {
-        Map<String, String> options = new HashMap<>();
-        options.put("type", "paimon");
-        options.putAll(paimonIndex.catalogOptionsForFlink());
-        StringBuilder withClause = new StringBuilder();
-        options.forEach((k, v) -> withClause.append("'").append(k).append("'='").append(v).append("',"));
-        if (withClause.length() > 0) {
-            withClause.setLength(withClause.length() - 1);
-        }
-        tEnv.executeSql("CREATE CATALOG " + PAIMON_CATALOG_NAME + " WITH (" + withClause + ")");
-    }
-
-    private static List<org.apache.iceberg.types.Types.NestedField> buildPkFields(Table table) {
-        return IcestreamTableConfig.from(table).primaryKey().fields();
     }
 }

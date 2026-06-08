@@ -33,6 +33,9 @@ public final class DataFileFlatMap implements FlatMapFunction<FileWorkItem, RowD
     private final SerializableTable serializableTable;
     private final Schema pkProjection;
     private final Types.StructType pkStruct;
+    // One reusable encoder per subtask (pkStruct is fixed), so the per-row index encode doesn't
+    // rebuild the avro schema/writer/PartitionData every call.
+    private transient IndexEncoding.AvroByteEncoder pkEncoder;
 
     public DataFileFlatMap(Table table, Schema pkProjection, Types.StructType pkStruct) {
         this.serializableTable = (SerializableTable) SerializableTable.copyOf(table);
@@ -42,11 +45,14 @@ public final class DataFileFlatMap implements FlatMapFunction<FileWorkItem, RowD
 
     @Override
     public void flatMap(FileWorkItem item, Collector<RowData> out) throws Exception {
+        if (pkEncoder == null) {
+            pkEncoder = new IndexEncoding.AvroByteEncoder(pkStruct);
+        }
         String partitionHex = IndexEncoding.toHex(item.partitionBytes());
         try (CloseableIterable<Record> records =
                 DataFileReader.read(serializableTable.io(), item.dataFile(), item.deletes(), pkProjection)) {
             for (Record record : records) {
-                String pkHex = IndexEncoding.toHex(IndexEncoding.encodeAsAvroBytes(pkStruct, record));
+                String pkHex = IndexEncoding.toHex(pkEncoder.encode(record));
                 long pos = (Long) record.getField(MetadataColumns.ROW_POSITION.name());
                 out.collect(toRowData(item.specId(), partitionHex, pkHex, item.dataFilePath(), pos));
             }

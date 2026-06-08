@@ -46,8 +46,15 @@ class PaimonIndexTest {
         assertThat(created.options())
                 .containsEntry(CoreOptions.BUCKET.key(), "4")
                 .containsEntry(CoreOptions.BUCKET_KEY.key(), "pk")
-                .containsEntry(CoreOptions.DELETION_VECTORS_ENABLED.key(), "true")
-                .containsEntry(CoreOptions.NUM_SORTED_RUNS_COMPACTION_TRIGGER.key(), "2");
+                // Merge-on-read (DV off → "value"-processor lookup files), avro, and radical lookup
+                // compaction that materializes + persists ssts to object store for download on the
+                // read path (see the LocalTableQuery monkey patch).
+                .containsEntry(CoreOptions.DELETION_VECTORS_ENABLED.key(), "false")
+                .containsEntry(CoreOptions.FILE_FORMAT.key(), "parquet")
+                .containsEntry(CoreOptions.FORCE_LOOKUP.key(), "true")
+                .containsEntry(CoreOptions.LOOKUP_COMPACT.key(), "radical")
+                .containsEntry("lookup.remote-file.enabled", "true")
+                .containsEntry("lookup.remote-file.level-threshold", "1");
 
         List<String> rowFieldNames =
                 created.rowType().getFields().stream().map(DataField::name).toList();
