@@ -54,8 +54,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Behavioral coverage for the Flink+Paimon converter end-to-end. Tests exercise the full
- * pipeline (HadoopCatalog + Paimon FilesystemCatalog + in-process Flink MiniCluster):
+ * Behavioral coverage for the production {@link StreamingFlinkDeleteFileCreator} end-to-end. Tests
+ * exercise the full pipeline (HadoopCatalog + Paimon FilesystemCatalog + in-process Flink
+ * MiniCluster) — one warm converter per case via {@link #convert}:
  * <ul>
  *   <li>V3 happy path + merge with existing DV.
  *   <li>V2 happy path + merge with existing FILE-scoped pos-delete.
@@ -65,7 +66,7 @@ import org.junit.jupiter.api.io.TempDir;
  *   <li>Empty-run no-op + LookupJoin planner assertion.
  * </ul>
  */
-class FlinkDeleteFileCreatorTest {
+class StreamingConverterBehaviorTest {
 
     private static final Schema UNPARTITIONED_SCHEMA = new Schema(
             NestedField.required(1, "id", Types.LongType.get()),
@@ -114,8 +115,7 @@ class FlinkDeleteFileCreatorTest {
         table.newRowDelta().addDeletes(eqDelete).commit();
         table.refresh();
 
-        CommitPlan plan = new FlinkDeleteFileCreator(flink, paimonIndex)
-                .create(id, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), config);
+        CommitPlan plan = convert(id, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), config);
 
         assertThat(plan.eqDeletesToRemove())
                 .extracting(DeleteFile::location)
@@ -138,8 +138,7 @@ class FlinkDeleteFileCreatorTest {
         table.newRowDelta().addDeletes(eqDelete).commit();
         table.refresh();
 
-        CommitPlan plan = new FlinkDeleteFileCreator(flink, paimonIndex)
-                .create(id, table, new EqualityDeleteFileRun(3L, List.of(eqDelete)), config);
+        CommitPlan plan = convert(id, table, new EqualityDeleteFileRun(3L, List.of(eqDelete)), config);
 
         assertThat(plan.deletesToAdd()).hasSize(1);
         assertThat(plan.deletesToAdd().get(0).recordCount())
@@ -163,8 +162,7 @@ class FlinkDeleteFileCreatorTest {
         table.newRowDelta().addDeletes(eqDelete).commit();
         table.refresh();
 
-        CommitPlan plan = new FlinkDeleteFileCreator(flink, paimonIndex)
-                .create(id, table, new EqualityDeleteFileRun(3L, List.of(eqDelete)), config);
+        CommitPlan plan = convert(id, table, new EqualityDeleteFileRun(3L, List.of(eqDelete)), config);
 
         assertThat(plan.deletesToAdd()).hasSize(2);
         assertThat(plan.deletesToAdd())
@@ -188,8 +186,7 @@ class FlinkDeleteFileCreatorTest {
         table.newRowDelta().addDeletes(engEqDelete).commit();
         table.refresh();
 
-        CommitPlan plan = new FlinkDeleteFileCreator(flink, paimonIndex)
-                .create(id, table, new EqualityDeleteFileRun(3L, List.of(engEqDelete)), config);
+        CommitPlan plan = convert(id, table, new EqualityDeleteFileRun(3L, List.of(engEqDelete)), config);
 
         assertThat(plan.deletesToAdd())
                 .as("hex-encoded partition_key prunes the lookup join to the eng partition only")
@@ -211,8 +208,7 @@ class FlinkDeleteFileCreatorTest {
         table.newRowDelta().addDeletes(eqDelete).commit();
         table.refresh();
 
-        CommitPlan plan = new FlinkDeleteFileCreator(flink, paimonIndex)
-                .create(id, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), config);
+        CommitPlan plan = convert(id, table, new EqualityDeleteFileRun(2L, List.of(eqDelete)), config);
 
         assertThat(plan.deletesToAdd()).hasSize(1);
         DeleteFile newPosDelete = plan.deletesToAdd().get(0);
@@ -235,8 +231,7 @@ class FlinkDeleteFileCreatorTest {
         table.newRowDelta().addDeletes(eqDelete).commit();
         table.refresh();
 
-        CommitPlan plan = new FlinkDeleteFileCreator(flink, paimonIndex)
-                .create(id, table, new EqualityDeleteFileRun(3L, List.of(eqDelete)), config);
+        CommitPlan plan = convert(id, table, new EqualityDeleteFileRun(3L, List.of(eqDelete)), config);
 
         assertThat(plan.deletesToAdd()).hasSize(1);
         DeleteFile merged = plan.deletesToAdd().get(0);
@@ -260,7 +255,7 @@ class FlinkDeleteFileCreatorTest {
             org.apache.flink.streaming.api.environment.StreamExecutionEnvironment env = ctx.newBatchEnv();
             org.apache.flink.table.api.bridge.java.StreamTableEnvironment tEnv =
                     org.apache.flink.table.api.bridge.java.StreamTableEnvironment.create(env);
-            registerPaimonCatalogForTest(tEnv);
+            PaimonLookupJoin.registerCatalog(tEnv, paimonIndex);
 
             org.apache.flink.streaming.api.datastream.DataStream<org.apache.flink.types.Row> empty =
                     env.fromCollection(List.<org.apache.flink.types.Row>of(),
@@ -279,8 +274,7 @@ class FlinkDeleteFileCreatorTest {
                     .build();
             tEnv.createTemporaryView("icestream_eq_deletes", tEnv.fromDataStream(empty, probeSchema));
 
-            FlinkDeleteFileCreator creator = new FlinkDeleteFileCreator(ctx, paimonIndex);
-            String sql = FlinkDeleteFileCreator.buildLookupJoinSql(creator.qualifiedIndexFqn(id));
+            String sql = LookupJoinSql.lookupJoin(PaimonLookupJoin.indexFqn(paimonIndex, id));
             String plan = tEnv.sqlQuery(sql).explain();
 
             assertThat(plan)
@@ -293,13 +287,6 @@ class FlinkDeleteFileCreatorTest {
         }
     }
 
-    private void registerPaimonCatalogForTest(org.apache.flink.table.api.bridge.java.StreamTableEnvironment tEnv) {
-        StringBuilder withClause = new StringBuilder("'type'='paimon'");
-        paimonIndex.catalogOptionsForFlink().forEach((k, v) ->
-                withClause.append(",'").append(k).append("'='").append(v).append("'"));
-        tEnv.executeSql("CREATE CATALOG paimon WITH (" + withClause + ")");
-    }
-
     @Test
     void emptyEqDeleteRunReturnsNoOpPlan() {
         TableIdentifier id = TableIdentifier.of("db", "events");
@@ -309,10 +296,17 @@ class FlinkDeleteFileCreatorTest {
         // Drive a snapshot so that table.currentSnapshot() is non-null in create().
         table.newAppend().commit();
 
-        CommitPlan plan = new FlinkDeleteFileCreator(flink, paimonIndex)
-                .create(id, table, new EqualityDeleteFileRun(1L, List.of()), config);
+        CommitPlan plan = convert(id, table, new EqualityDeleteFileRun(1L, List.of()), config);
 
         assertThat(plan.isNoOp()).isTrue();
+    }
+
+    /** One conversion through a fresh warm streaming converter, closed afterwards. */
+    private CommitPlan convert(TableIdentifier id, Table table, EqualityDeleteFileRun run, IcestreamTableConfig config) {
+        try (StreamingFlinkDeleteFileCreator converter =
+                new StreamingFlinkDeleteFileCreator(flink, paimonIndex, 500, 120_000)) {
+            return converter.create(id, table, run, config);
+        }
     }
 
     private IcestreamTableConfig indexAndCommit(TableIdentifier id, Table table, DataFile... dataFiles) {

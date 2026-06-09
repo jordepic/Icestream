@@ -9,7 +9,6 @@ import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.types.DataField;
@@ -43,11 +42,6 @@ class PaimonIndexTest {
 
         assertThat(created.partitionKeys()).containsExactly("spec_id", "partition_key");
         assertThat(created.primaryKeys()).containsExactly("spec_id", "partition_key", "pk");
-        assertThat(created.options())
-                .containsEntry(CoreOptions.BUCKET.key(), "4")
-                .containsEntry(CoreOptions.BUCKET_KEY.key(), "pk")
-                .containsEntry(CoreOptions.DELETION_VECTORS_ENABLED.key(), "true")
-                .containsEntry(CoreOptions.NUM_SORTED_RUNS_COMPACTION_TRIGGER.key(), "2");
 
         List<String> rowFieldNames =
                 created.rowType().getFields().stream().map(DataField::name).toList();

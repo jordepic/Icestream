@@ -39,3 +39,29 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 app.kubernetes.io/name: {{ include "icestream.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
+
+{{/* Conversion-channel Service name + URL. In flinkMode=remote the session-cluster TaskManagers
+     reach the icestream pod's channel server (lookup work-in/results-out) through this Service. */}}
+{{- define "icestream.channelServiceName" -}}
+{{- printf "%s-channel" (include "icestream.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* Iceberg + Paimon catalog env. Include with nindent. */}}
+{{- define "icestream.catalogEnv" -}}
+- name: ICESTREAM_ICEBERG_REST_URI
+  value: {{ .Values.appConfig.iceberg.restUri | quote }}
+- name: ICESTREAM_ICEBERG_WAREHOUSE
+  value: {{ .Values.appConfig.iceberg.warehouse | quote }}
+{{- range $k, $v := .Values.appConfig.iceberg.extraOptions }}
+- name: ICESTREAM_ICEBERG_OPT_{{ $k | upper | replace "." "_" | replace "-" "_" }}
+  value: {{ $v | quote }}
+{{- end }}
+- name: ICESTREAM_PAIMON_WAREHOUSE
+  value: {{ .Values.appConfig.paimon.warehouse | quote }}
+- name: ICESTREAM_PAIMON_DATABASE
+  value: {{ .Values.appConfig.paimon.database | quote }}
+{{- range $k, $v := .Values.appConfig.paimon.extraOptions }}
+- name: ICESTREAM_PAIMON_OPT_{{ $k | upper | replace "." "_" | replace "-" "_" }}
+  value: {{ $v | quote }}
+{{- end }}
+{{- end -}}

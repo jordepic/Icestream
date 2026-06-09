@@ -5,7 +5,8 @@ import static io.github.jordepic.icestream.master.EnvConfig.optionsFromEnv;
 import static io.github.jordepic.icestream.master.EnvConfig.requireEnv;
 import static io.github.jordepic.icestream.master.LifecycleHooks.closeQuietly;
 
-import io.github.jordepic.icestream.flinkpaimon.converter.FlinkDeleteFileCreator;
+import io.github.jordepic.icestream.converter.DeleteConverter;
+import io.github.jordepic.icestream.flinkpaimon.converter.StreamingFlinkDeleteFileCreator;
 import io.github.jordepic.icestream.flinkpaimon.flink.FlinkContext;
 import io.github.jordepic.icestream.flinkpaimon.index.PaimonIndex;
 import io.github.jordepic.icestream.flinkpaimon.indexer.FlinkDataFileIndexer;
@@ -32,19 +33,34 @@ public final class FlinkMain {
 
     public static void main(String[] args) {
         Config config = Config.fromEnv();
-        log.info("Starting icestream Flink+Paimon master with {}", config);
+        log.info("Starting icestream Flink+Paimon {}", config);
+        run(config);
+    }
 
+    /**
+     * One process: runs the master control loop (poll → plan → index → convert → commit → watermark)
+     * and, in the same JVM, owns the converter that drives the Flink job. The streaming converter
+     * hosts the channel server its job's operators dial back into for work-in/results-out; with
+     * {@code FLINK_MODE=remote} the job runs on a session cluster and the TaskManagers reach the
+     * advertised host over the network, with {@code local} an in-pod MiniCluster reaches it over
+     * loopback. The master logic calls the converter/indexer directly — there is no separate
+     * "worker" process or RPC hop.
+     */
+    private static void run(Config config) {
+        boolean remoteFlink = "remote".equals(config.flinkMode());
         Catalog icebergCatalog = buildIcebergCatalog(config);
-        FlinkContext flink = config.flinkMode().equals("remote")
-                ? FlinkContext.remote(config.flinkJmHost(), config.flinkJmPort(), config.flinkParallelism())
+        FlinkContext flink = remoteFlink
+                ? FlinkContext.remote(
+                        config.flinkJmHost(), config.flinkJmPort(), config.flinkParallelism(), config.flinkJars())
                 : FlinkContext.local(config.flinkParallelism());
-
         PaimonIndex paimonIndex =
                 PaimonIndex.create(config.paimonWarehouse(), config.paimonDatabase(), config.paimonOptions());
+
+        DeleteConverter converter = buildConverter(config, flink, paimonIndex, remoteFlink);
         TableProcessor processor = new TableProcessor(
                 new SnapshotPlanner(),
                 new FlinkDataFileIndexer(flink, paimonIndex),
-                new FlinkDeleteFileCreator(flink, paimonIndex),
+                converter,
                 paimonIndex,
                 IcestreamMetrics.NOOP);
         MasterLoop loop = new MasterLoop(
@@ -54,6 +70,9 @@ public final class FlinkMain {
                 () -> {
                     log.info("Shutdown signal received");
                     loop.stop();
+                    if (converter instanceof AutoCloseable c) {
+                        closeQuietly(c::close, "converter");
+                    }
                     closeQuietly(flink::close, "flink");
                     closeQuietly(paimonIndex.catalog()::close, "paimon-catalog");
                     if (icebergCatalog instanceof Closeable c) {
@@ -63,6 +82,25 @@ public final class FlinkMain {
                 "icestream-shutdown"));
 
         loop.run();
+    }
+
+    /**
+     * Builds the streaming converter: one long-lived warm Flink job whose Paimon lookup cache stays
+     * warm across conversions (see {@link StreamingFlinkDeleteFileCreator}), avoiding the
+     * per-conversion SST/lookup rebuild that dominates cost. The converter hosts the channel server
+     * itself; on a remote cluster the TaskManagers reach it at the configured advertised host:port,
+     * in a local MiniCluster over loopback.
+     */
+    private static DeleteConverter buildConverter(
+            Config config, FlinkContext flink, PaimonIndex paimonIndex, boolean remoteFlink) {
+        log.info("Using streaming converter (warm lookup cache, checkpoint={}ms, advertised channel host={})",
+                config.streamingCheckpointMs(), remoteFlink ? config.channelAdvertisedHost() : "localhost");
+        return remoteFlink
+                ? new StreamingFlinkDeleteFileCreator(
+                        flink, paimonIndex, config.streamingCheckpointMs(), config.conversionTimeoutMs(),
+                        config.channelPort(), config.channelAdvertisedHost())
+                : new StreamingFlinkDeleteFileCreator(
+                        flink, paimonIndex, config.streamingCheckpointMs(), config.conversionTimeoutMs());
     }
 
     private static Catalog buildIcebergCatalog(Config config) {
@@ -88,6 +126,11 @@ public final class FlinkMain {
             String flinkJmHost,
             int flinkJmPort,
             int flinkParallelism,
+            String[] flinkJars,
+            long streamingCheckpointMs,
+            long conversionTimeoutMs,
+            int channelPort,
+            String channelAdvertisedHost,
             Duration pollInterval,
             Duration idleBackoff,
             int maxConcurrentTasks) {
@@ -104,9 +147,27 @@ public final class FlinkMain {
                     envOrDefault("ICESTREAM_FLINK_JM_HOST", "localhost"),
                     Integer.parseInt(envOrDefault("ICESTREAM_FLINK_JM_PORT", "8081")),
                     Integer.parseInt(envOrDefault("ICESTREAM_FLINK_PARALLELISM", "4")),
+                    parseJars(envOrDefault("ICESTREAM_FLINK_JARS", "")),
+                    Long.parseLong(envOrDefault("ICESTREAM_STREAMING_CHECKPOINT_MS", "2000")),
+                    Long.parseLong(envOrDefault("ICESTREAM_CONVERSION_TIMEOUT_MS", "600000")),
+                    Integer.parseInt(envOrDefault("ICESTREAM_CHANNEL_PORT", "8090")),
+                    // Host a remote TaskManager uses to reach THIS process's channel server (streaming +
+                    // remote). Defaults to localhost (fine for a same-host standalone cluster); set to a
+                    // routable host/Service DNS when the session cluster runs elsewhere.
+                    envOrDefault("ICESTREAM_CHANNEL_ADVERTISED_HOST", "localhost"),
                     Duration.ofSeconds(Long.parseLong(envOrDefault("ICESTREAM_POLL_INTERVAL_SECONDS", "10"))),
                     Duration.ofSeconds(Long.parseLong(envOrDefault("ICESTREAM_IDLE_BACKOFF_SECONDS", "60"))),
                     Integer.parseInt(envOrDefault("ICESTREAM_MAX_CONCURRENT_TASKS", "4")));
+        }
+
+        private static String[] parseJars(String csv) {
+            if (csv.isBlank()) {
+                return new String[0];
+            }
+            return java.util.Arrays.stream(csv.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .toArray(String[]::new);
         }
     }
 }

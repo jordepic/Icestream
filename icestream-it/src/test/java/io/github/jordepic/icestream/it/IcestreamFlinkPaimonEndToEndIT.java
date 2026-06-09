@@ -3,7 +3,8 @@ package io.github.jordepic.icestream.it;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.jordepic.icestream.converter.ConversionCommitter;
-import io.github.jordepic.icestream.flinkpaimon.converter.FlinkDeleteFileCreator;
+import io.github.jordepic.icestream.converter.DeleteConverter;
+import io.github.jordepic.icestream.flinkpaimon.converter.StreamingFlinkDeleteFileCreator;
 import io.github.jordepic.icestream.flinkpaimon.flink.FlinkContext;
 import io.github.jordepic.icestream.flinkpaimon.index.PaimonIndex;
 import io.github.jordepic.icestream.flinkpaimon.indexer.FlinkDataFileIndexer;
@@ -219,28 +220,31 @@ class IcestreamFlinkPaimonEndToEndIT {
                 PaimonIndex paimonIndex = PaimonIndex.create(
                         "s3://" + S3_BUCKET + "/paimon/", "icestream", paimonOptions());
 
-                KafkaJsonProducer producerRunnable = new KafkaJsonProducer(
-                        kafka.getBootstrapServers(),
-                        KAFKA_TOPIC,
-                        100,
-                        RUN_DURATION,
-                        Duration.ofMillis(20),
-                        42L);
-                Thread producerThread = new Thread(producerRunnable, "icestream-it-producer");
-                producerThread.setDaemon(true);
-                producerThread.start();
+                try (StreamingFlinkDeleteFileCreator converter =
+                        new StreamingFlinkDeleteFileCreator(flink, paimonIndex, 500, 120_000)) {
+                    KafkaJsonProducer producerRunnable = new KafkaJsonProducer(
+                            kafka.getBootstrapServers(),
+                            KAFKA_TOPIC,
+                            100,
+                            RUN_DURATION,
+                            Duration.ofMillis(20),
+                            42L);
+                    Thread producerThread = new Thread(producerRunnable, "icestream-it-producer");
+                    producerThread.setDaemon(true);
+                    producerThread.start();
 
-                MasterLoop loop = newMasterLoop(catalog, flink, paimonIndex);
-                Thread loopThread = new Thread(loop::run, "icestream-it-master");
-                loopThread.setDaemon(true);
-                loopThread.start();
+                    MasterLoop loop = newMasterLoop(catalog, flink, paimonIndex, converter);
+                    Thread loopThread = new Thread(loop::run, "icestream-it-master");
+                    loopThread.setDaemon(true);
+                    loopThread.start();
 
-                Thread.sleep(RUN_DURATION.toMillis());
+                    Thread.sleep(RUN_DURATION.toMillis());
 
-                producerRunnable.stop();
-                producerThread.join(Duration.ofSeconds(5).toMillis());
-                loop.stop();
-                loopThread.join(Duration.ofSeconds(10).toMillis());
+                    producerRunnable.stop();
+                    producerThread.join(Duration.ofSeconds(5).toMillis());
+                    loop.stop();
+                    loopThread.join(Duration.ofSeconds(10).toMillis());
+                }
 
                 paimonIndex.catalog().close();
             }
@@ -295,11 +299,12 @@ class IcestreamFlinkPaimonEndToEndIT {
 
     private record RowKey(long id, String name, long ts) {}
 
-    private static MasterLoop newMasterLoop(RESTCatalog catalog, FlinkContext flink, PaimonIndex paimonIndex) {
+    private static MasterLoop newMasterLoop(
+            RESTCatalog catalog, FlinkContext flink, PaimonIndex paimonIndex, DeleteConverter converter) {
         TableProcessor processor = new TableProcessor(
                 new SnapshotPlanner(),
                 new FlinkDataFileIndexer(flink, paimonIndex),
-                new FlinkDeleteFileCreator(flink, paimonIndex),
+                converter,
                 paimonIndex,
                 IcestreamMetrics.NOOP);
         return new MasterLoop(catalog, processor, ICESTREAM_POLL, ICESTREAM_IDLE_BACKOFF, 2);

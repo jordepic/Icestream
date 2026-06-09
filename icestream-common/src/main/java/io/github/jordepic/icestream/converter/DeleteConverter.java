@@ -12,7 +12,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
  * that {@link ConversionCommitter} will commit in a single {@code RowDelta}.
  *
  * <p>Implementations: {@code SparkDeleteFileCreator} (replica-aware Cassandra join via Spark
- * Cassandra connector), {@code FlinkDeleteFileCreator} (per-row indexed lookup join against
+ * Cassandra connector), {@code StreamingFlinkDeleteFileCreator} (warm indexed lookup join against
  * Paimon via Flink Table API).
  *
  * <p>Pure: returns the plan, does not commit. The caller (TableProcessor) hands it to

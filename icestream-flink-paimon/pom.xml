@@ -19,9 +19,9 @@
     </description>
 
     <properties>
-        <docker.image.name>icestream/icestream-flink-paimon-master</docker.image.name>
+        <docker.image.name>icestream/icestream-flink-paimon</docker.image.name>
         <docker.image.tag>${project.version}</docker.image.tag>
-        <master.base.image>eclipse-temurin:17-jre</master.base.image>
+        <base.image>eclipse-temurin:17-jre</base.image>
     </properties>
 
     <dependencies>
@@ -196,7 +196,7 @@
                         </goals>
                         <phase>package</phase>
                         <configuration>
-                            <outputDirectory>${project.build.directory}/master-libs</outputDirectory>
+                            <outputDirectory>${project.build.directory}/app-libs</outputDirectory>
                             <includeScope>runtime</includeScope>
                             <includeTypes>jar</includeTypes>
                             <stripVersion>false</stripVersion>
@@ -210,7 +210,7 @@
                 <version>3.4.4</version>
                 <configuration>
                     <from>
-                        <image>${master.base.image}</image>
+                        <image>${base.image}</image>
                     </from>
                     <to>
                         <image>${docker.image.name}:${docker.image.tag}</image>
@@ -222,7 +222,7 @@
                     <extraDirectories>
                         <paths>
                             <path>
-                                <from>${project.build.directory}/master-libs</from>
+                                <from>${project.build.directory}/app-libs</from>
                                 <into>/app/libs</into>
                             </path>
                         </paths>
@@ -231,4 +231,123 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+          Builds the uber job jar shipped to a remote Flink session cluster (ICESTREAM_FLINK_JARS).
+          It must carry everything the standing job's OPERATORS need that the cluster does not already
+          provide: our classes + Iceberg readers/writers + the Paimon connector + Hadoop FS. Flink core
+          + Table API live in the cluster's lib/, so org.apache.flink:* (and flink-shaded-*) are excluded
+          to avoid loading the same classes from both the parent and the child-first user classloader;
+          slf4j is cluster-provided; the AWS/S3 bundles are dropped (local-FS benchmark doesn't need them).
+
+            mvn -pl icestream-flink-paimon -am -DskipTests -Pcluster-jar package
+            -> target/icestream-flink-paimon-<v>-cluster.jar
+        -->
+        <profile>
+            <id>cluster-jar</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-shade-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>cluster-jar</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>shade</goal>
+                                </goals>
+                                <configuration>
+                                    <shadedArtifactAttached>true</shadedArtifactAttached>
+                                    <shadedClassifierName>cluster</shadedClassifierName>
+                                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                                    <artifactSet>
+                                        <excludes>
+                                            <exclude>org.apache.flink:*</exclude>
+                                            <exclude>org.slf4j:*</exclude>
+                                            <exclude>org.apache.iceberg:iceberg-aws-bundle</exclude>
+                                            <exclude>org.apache.paimon:paimon-s3</exclude>
+                                        </excludes>
+                                    </artifactSet>
+                                    <filters>
+                                        <filter>
+                                            <artifact>*:*</artifact>
+                                            <excludes>
+                                                <exclude>META-INF/*.SF</exclude>
+                                                <exclude>META-INF/*.DSA</exclude>
+                                                <exclude>META-INF/*.RSA</exclude>
+                                                <exclude>module-info.class</exclude>
+                                            </excludes>
+                                        </filter>
+                                        <!--
+                                          Drop Paimon's own LocalTableQuery so our same-FQN monkey patch
+                                          (wires the remote-sst downloader on the read path) wins on the
+                                          TaskManager classpath. The class is bundled in both paimon jars.
+                                        -->
+                                        <filter>
+                                            <artifact>org.apache.paimon:paimon-bundle</artifact>
+                                            <excludes>
+                                                <exclude>org/apache/paimon/table/query/LocalTableQuery.class</exclude>
+                                            </excludes>
+                                        </filter>
+                                        <filter>
+                                            <artifact>org.apache.paimon:paimon-flink-2.0</artifact>
+                                            <excludes>
+                                                <exclude>org/apache/paimon/table/query/LocalTableQuery.class</exclude>
+                                            </excludes>
+                                        </filter>
+                                    </filters>
+                                    <transformers>
+                                        <transformer
+                                            implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                    </transformers>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <!--
+                      Stage the shaded jar into a jib extra-directory so the single icestream image carries it at
+                      /app/job/icestream-cluster.jar (ICESTREAM_FLINK_JARS). Runs after shade (same phase,
+                      declared later). Build the image with this profile active:
+                        mvn -pl icestream-flink-paimon -am -DskipTests -Pcluster-jar package jib:dockerBuild
+                    -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>stage-cluster-jar-for-image</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target>
+                                        <mkdir dir="${project.build.directory}/job-jar/app/job"/>
+                                        <copy file="${project.build.directory}/${project.build.finalName}-cluster.jar"
+                                              tofile="${project.build.directory}/job-jar/app/job/icestream-cluster.jar"/>
+                                    </target>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>com.google.cloud.tools</groupId>
+                        <artifactId>jib-maven-plugin</artifactId>
+                        <configuration>
+                            <extraDirectories>
+                                <paths combine.children="append">
+                                    <path>
+                                        <from>${project.build.directory}/job-jar</from>
+                                        <into>/</into>
+                                    </path>
+                                </paths>
+                            </extraDirectories>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

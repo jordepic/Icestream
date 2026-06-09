@@ -17,7 +17,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.util.Collector;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
@@ -25,6 +24,7 @@ import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.SerializableTable;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -55,13 +55,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Direct filter-logic coverage for the per-task scan that powers
- * {@link io.github.jordepic.icestream.converter.ExistingPerFileDeleteLoader#scanManifest}.
- * Exercises the predicate matrix without spinning up a Flink runtime: build a real iceberg
- * snapshot, hand the resulting {@link ManifestFile} to the {@link ScanDeleteManifestsFlatMap}, and
- * inspect what it emits.
+ * Direct filter-logic coverage for
+ * {@link io.github.jordepic.icestream.converter.ExistingPerFileDeleteLoader#scanManifest} — the scan
+ * {@link RequestToExistingDeletes} drives per conversion. Exercises the predicate matrix without a
+ * Flink runtime: build a real iceberg snapshot, scan its delete manifests, and inspect what's emitted.
  */
-class ScanDeleteManifestsFlatMapTest {
+class ExistingPerFileDeleteScanTest {
 
     private static final Schema UNPARTITIONED_SCHEMA = new Schema(
             NestedField.required(1, "id", Types.LongType.get()),
@@ -95,7 +94,7 @@ class ScanDeleteManifestsFlatMapTest {
         writeAndCommitDv(table, dataFile, List.of(0L));
 
         List<Tuple2<String, ExistingPerFileDeletes>> emitted =
-                runFlatMap(table, 3, Set.of(unpartitionedKey(table)));
+                runScan(table, 3, Set.of(unpartitionedKey(table)));
 
         assertThat(emitted).hasSize(1);
         assertThat(emitted.get(0).f0).isEqualTo(dataFile.location());
@@ -112,7 +111,7 @@ class ScanDeleteManifestsFlatMapTest {
         DeleteFile committed = writeAndCommitFileScopedPosDelete(table, dataFile, List.of(0L));
 
         List<Tuple2<String, ExistingPerFileDeletes>> emitted =
-                runFlatMap(table, 2, Set.of(unpartitionedKey(table)));
+                runScan(table, 2, Set.of(unpartitionedKey(table)));
 
         assertThat(emitted).hasSize(1);
         assertThat(emitted.get(0).f0).isEqualTo(dataFile.location());
@@ -137,7 +136,7 @@ class ScanDeleteManifestsFlatMapTest {
         writeAndCommitDv(table, salesFile, List.of(0L));
 
         List<Tuple2<String, ExistingPerFileDeletes>> emitted =
-                runFlatMap(table, 3, Set.of(partitionKey(table, "eng")));
+                runScan(table, 3, Set.of(partitionKey(table, "eng")));
 
         assertThat(emitted)
                 .as("only the eng-partition DV passes; the sales partition isn't touched")
@@ -145,27 +144,19 @@ class ScanDeleteManifestsFlatMapTest {
         assertThat(emitted.get(0).f0).isEqualTo(engFile.location());
     }
 
-    private List<Tuple2<String, ExistingPerFileDeletes>> runFlatMap(
-            Table table, int formatVersion, Set<PartitionKey> touchedPartitions) throws Exception {
-        ScanDeleteManifestsFlatMap flatMap = new ScanDeleteManifestsFlatMap(table, formatVersion, touchedPartitions);
+    private List<Tuple2<String, ExistingPerFileDeletes>> runScan(
+            Table table, int formatVersion, Set<PartitionKey> touchedPartitions) {
+        SerializableTable serializableTable = (SerializableTable) SerializableTable.copyOf(table);
         List<Tuple2<String, ExistingPerFileDeletes>> emitted = new ArrayList<>();
-        Collector<Tuple2<String, ExistingPerFileDeletes>> collector = collectorBackedBy(emitted);
         for (ManifestFile manifest : ExistingPerFileDeleteLoader.deleteManifests(table)) {
-            flatMap.flatMap(manifest, collector);
+            ExistingPerFileDeleteLoader.scanManifest(
+                    serializableTable,
+                    formatVersion,
+                    touchedPartitions,
+                    manifest,
+                    (path, entry) -> emitted.add(Tuple2.of(path, entry)));
         }
         return emitted;
-    }
-
-    private static <T> Collector<T> collectorBackedBy(List<T> sink) {
-        return new Collector<>() {
-            @Override
-            public void collect(T record) {
-                sink.add(record);
-            }
-
-            @Override
-            public void close() {}
-        };
     }
 
     private DataFile writeUnpartitionedDataFile(Table table, List<Record> rows) throws IOException {

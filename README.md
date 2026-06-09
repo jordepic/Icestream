@@ -188,6 +188,29 @@ the same avro `StructLike` byte representation, computed in
 | Bucketing        | `bucket-key = pk`, `bucket = N` | Fixed-bucket mode (lookup join requires `bucket > 0`).|
 | Compaction       | `deletion-vectors.enabled = true`, `num-sorted-run.compaction-trigger = 2` | Writer auto-compacts; DV mode triggers lookup-friendly compaction without the per-checkpoint cost of `changelog-producer = lookup`. |
 
+#### Lookup-cache tuning (Flink + Paimon)
+
+This cache only earns its keep because the Flink converter is **one long-lived streaming job**, not a
+fresh job per conversion. The per-bucket `.lookup` SSTs are materialized (or downloaded, with remote
+lookup files) and their pages warmed *once*, then reused across every conversion the standing job
+serves; a job-per-conversion would re-pay that cold start each time — the SST download dominates
+(~5–25× slower in benchmarks; see [Benchmark](#benchmark-flink--paimon-distributed-cluster)) — and
+throw the warm cache away between runs. That's the core reason the converter is a standing job: the
+toggles below govern a cache that persists for the life of the job.
+
+The lookup join materializes per-bucket `.lookup` SST sidecars on the TaskManager's local disk and
+caches their pages in memory. Three Paimon toggles control how much stays resident vs. gets paged
+in/out (set them as index-table options):
+
+- `lookup.cache-max-memory-size` (default `256 mb`) — in-memory page cache over the lookup files.
+  Raise it to keep more of the working set hot and avoid memory↔local-disk paging.
+- `lookup.cache-file-retention` (default `1 h`) — how long an *idle* lookup file stays on local disk
+  before it's deleted. Raise it so a bursty/idle converter doesn't drop its warm files between runs.
+- `lookup.cache-max-disk-size` (default **unlimited**) — local-disk budget for the lookup files. Left
+  unlimited, files accumulate until the physical disk fills (a hard failure). Set a budget ≤ free disk
+  so Paimon LRU-evicts instead; on a huge index the evicted file is then re-materialized on next probe
+  (rebuilt from the data file, or downloaded if remote lookup files are enabled).
+
 ### Why this design
 
 - **Async + persistent index**: amortize indexing over time; conversions
@@ -323,18 +346,39 @@ helm install icestream-spark-cassandra ./icestream-spark-cassandra/helm \
 
 ```
 helm install icestream-flink-paimon ./icestream-flink-paimon/helm \
-  --set image.repository=icestream/icestream-flink-paimon-master \
+  --set image.repository=icestream/icestream-flink-paimon \
   --set image.tag=1.0-SNAPSHOT \
   --set appConfig.iceberg.restUri=http://iceberg-rest:8181 \
   --set appConfig.iceberg.warehouse=s3://warehouse/ \
-  --set appConfig.paimon.warehouse=s3://warehouse/paimon/ \
-  --set flinkSessionCluster.enabled=true
+  --set appConfig.paimon.warehouse=s3://warehouse/paimon/
 ```
 
-The Flink+Paimon chart provisions a `FlinkDeployment` CR — the
-`flink-kubernetes-operator` must already be installed cluster-wide. The
-master pod is a separate `Deployment` that talks to the operator-managed JM
-service via REST.
+The chart deploys a **single icestream pod** — one process runs the polling
+control loop *and* owns the converter that drives the Flink job (there is no
+separate "worker" pod and no RPC hop). The `--set flinkMode=…` axis picks where
+the Flink job runs:
+
+- **`remote`** (default, production): the pod submits one standing streaming
+  converter job to a Flink session cluster (`FLINK_MODE=remote`) and hosts the
+  conversion **channel server** on port 8090; the cluster's TaskManagers dial
+  back to the pod's `Service` for the lookup work-in/results-out channel — so the
+  channel's advertised URL is its in-cluster Service DNS. The chart also
+  provisions a `FlinkDeployment` CR (`flink-kubernetes-operator` must be
+  installed cluster-wide). All file reads and writes run distributed on the
+  cluster; only the commit is centralized in the pod. Set
+  `--set flinkSessionCluster.enabled=false` to point at a pre-existing
+  `FlinkDeployment` (configure `appConfig.flink.sessionCluster.*`).
+- **`local`** (dev/small): a single pod running the control loop + an in-pod
+  `MiniCluster` (`FLINK_MODE=local`). No session cluster, no channel server,
+  in-process transport.
+
+In `remote` mode the **image must contain the shaded job jar** it ships to the
+TaskManagers (`ICESTREAM_FLINK_JARS=/app/job/icestream-cluster.jar`). Build it
+with the `cluster-jar` profile active so jib stages the jar into the image:
+
+```
+mvn -pl icestream-flink-paimon -am -DskipTests -Pcluster-jar package jib:dockerBuild
+```
 
 ## Limitations
 
@@ -366,4 +410,91 @@ These are deliberate v1 simplifications, not permanent constraints.
   each running Kafka + Flink upsert ingestion + the corresponding backend
   for ~60 s and asserting that every snapshot tagged
   `icestream-converted=true` has the same visible row set as its parent.
+
+## Benchmark (Flink + Paimon, distributed cluster)
+
+> **The `ConversionBenchmark` harness and the batch (full-scan) control converter live on the
+> [`benchmarking`](https://github.com/jordepic/Icestream/tree/benchmarking) branch, not on `main`** —
+> `main` ships only the production streaming converter. The results below were produced on that branch
+> and are kept here as design justification; the `mvn -Pbenchmark` invocations apply to that branch.
+
+`ConversionBenchmark` (in `icestream-it`, `@Tag("benchmark")`) times the warm indexed
+lookup-conversion against an isolated batch (full-scan) join as the eq-delete size **D** sweeps
+from 1 to 1,000,000, to find where the point-lookup (O(D·log N)) loses to the full scan (O(N)).
+
+**Setup for the run below:**
+
+| | |
+|---|---|
+| Rows (N) | 550,000,000 |
+| Iceberg data files | 64 (unpartitioned, format-version 2) |
+| Iceberg table size | ~10 GB parquet |
+| Index buckets | 8 (`bucket-key = pk`) |
+| Index data-file format | parquet + zstd (Paimon defaults) |
+| Paimon index size | **~17 GB**, of which **~9.4 GB** is the `.lookup` SST sidecars (the only part the lookup pages) |
+| Cluster | Flink 2.0.0 standalone — 1 JobManager + **2 TaskManagers** (2 slots each), job parallelism 4; TM heap sized to hold the per-subtask cache |
+| Compute split | warm lookup distributed on the cluster (reads + bucket-keyed lookup + keyed writes across both TMs); batch-join control on a local MiniCluster |
+
+**Lookup-cache sweep** (`lookup.cache-max-memory-size`, which is **per lookup subtask** — at
+parallelism 4 that's 2 subtasks per TM, so a 1 GB setting ≈ 2 GB of cache per TM). The index uses
+radical lookup compaction + remote (object-store) lookup files, so a paged-out SST is downloaded, not
+rebuilt (see [Lookup-cache tuning](#lookup-cache-tuning-flink--paimon)). Warm-lookup latency at three
+cache sizes vs the batch-join baseline:
+
+```
+       D        D/N        256 MB        1 GB         2 GB       batch-join*
+       1     0.0000%        0.13 s       0.15 s       0.30 s      ~130 s
+      10     0.0000%        0.55 s       0.51 s       0.23 s        —
+     100     0.0000%        0.81 s       0.82 s       0.83 s        —
+   1,000     0.0002%        1.36 s       1.13 s       1.10 s        —
+  10,000     0.0018%        6.22 s       1.94 s       2.12 s        —
+ 100,000     0.0182%       52.31 s      10.95 s      10.96 s        —
+1,000,000    0.1818%      482.60 s      63.03 s      64.52 s      ~141 s
+```
+\* batch-join is the cache-independent local O(N) control, measured at D=1 and 1M (it's flat in D):
+~130 s and ~141 s.
+
+**Takeaways:**
+- **With an adequately-sized cache, indexed lookup wins the entire D range.** At 1 GB, lookup beats
+  batch from D=1 (855×) through D=1M (63 s vs ~141 s, 2.2×) — the crossover is off the chart, because
+  even D=1M is only 0.18% of N.
+- **The cache saturates at ~1 GB/subtask.** 256 MB → 1 GB is huge at the paging end (D=1M: 482 s →
+  63 s, 7.7×; D=100k: 52 s → 11 s), but 1 GB → 2 GB is flat (within noise). The lookup only needs its
+  **hot working set** resident — bloom filters + index blocks + the touched data pages, under 1 GB per
+  subtask here — not the full ~2.35 GB SST slice. **Size the cache to the hot set, not the footprint.**
+- **Small D is cache-insensitive** (D≤1k touch few SSTs); the cache only matters at the big-D paging
+  end, where a too-small (256 MB) cache thrashes against the 9.4 GB SST set and can hand D=1M to batch.
+- **Flake-free at every cache size.** The converter's channel transport is hardened against the
+  long-poll connection resets that previously restarted the standing job and lost conversions; the
+  correctness invariant (positions = D) held on every point.
+
+**Index data-file format.** The data files are parquet + zstd (Paimon defaults). The format is
+independent of lookup speed — the lookup probes the separate, format-agnostic `.lookup` SSTs — but it
+transforms the index on disk: zstd compresses the heavily-repeating `data_file_path`/`pk` columns ~7×
+vs the earlier avro/uncompressed layout (e.g. at 55M the index shrank 5.7 GB → 1.6 GB, 40 → 8 files,
+with comparable reindex time). So parquet+zstd is a strict win — far smaller index, no cost to
+warm-lookup speed — and is the default.
+
+Run it (needs a running Flink 2.0.0 standalone cluster + the shaded job jar):
+
+```
+mvn -pl icestream-flink-paimon -am -DskipTests -Pcluster-jar package
+mvn -pl icestream-it test -Pbenchmark -Dtest=ConversionBenchmark \
+    -Dbench.remoteCluster=true -Dbench.jmPort=8081 \
+    -Dbench.flinkJars=icestream-flink-paimon/target/icestream-flink-paimon-*-cluster.jar \
+    -Dbench.warehouseDir=/path/to/shared/warehouse \
+    -Dbench.rows=550000000 -Dbench.files=64 -Dbench.buckets=8 -Dbench.slots=4 \
+    -Dbench.lookupMemCache="1 gb" \
+    -Dbench.dSweep=1,10,100,1000,10000,100000,1000000 -Dbench.batchDValues=1,1000000
+```
+
+Notes:
+- `bench.batchDValues` limits the (expensive, O(N)) batch-join control to a couple of D points — it's
+  flat in D, so D=1 and 1M pin the baseline — while the lookup arm still sweeps every D. Lookup
+  correctness is checked against the invariant `positions = D` on every point regardless.
+- `lookupMemCache` is **per lookup subtask** (2 subtasks/TM at parallelism 4), so size the TaskManager
+  heap to hold it. A literal zero-/sub-page cache is degenerate (returns wrong results); the smallest
+  meaningful value is ≥ a cache page, and ~1 GB/subtask saturates the hot set at this scale.
+- These numbers are flake-free thanks to the hardened channel transport (the source's long-poll retries
+  transient connection resets instead of failing the task and restarting the standing job).
 

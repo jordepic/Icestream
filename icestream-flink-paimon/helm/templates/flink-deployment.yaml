@@ -1,8 +1,8 @@
-{{- if .Values.flinkSessionCluster.enabled -}}
+{{- if and (eq .Values.flinkMode "remote") .Values.flinkSessionCluster.enabled -}}
 # Long-lived Flink session cluster reconciled by flink-kubernetes-operator. The
 # operator must already be installed cluster-wide for this CR to take effect.
-# The master pod talks to this cluster via REST (RestClusterClient) on the
-# service the operator creates: <metadata.name>-rest:8081.
+# The icestream pod submits the standing job to this cluster via REST
+# (RestClusterClient) on the service the operator creates: <metadata.name>-rest:8081.
 apiVersion: flink.apache.org/v1beta1
 kind: FlinkDeployment
 metadata:

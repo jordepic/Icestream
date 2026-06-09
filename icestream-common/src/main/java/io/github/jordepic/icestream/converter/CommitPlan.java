@@ -1,5 +1,6 @@
 package io.github.jordepic.icestream.converter;
 
+import java.io.Serializable;
 import java.util.List;
 import org.apache.iceberg.DeleteFile;
 
@@ -15,7 +16,8 @@ public record CommitPlan(
         long startingSnapshotId,
         List<DeleteFile> eqDeletesToRemove,
         List<DeleteFile> existingDeletesToRemove,
-        List<DeleteFile> deletesToAdd) {
+        List<DeleteFile> deletesToAdd)
+        implements Serializable {
 
     public boolean isNoOp() {
         return eqDeletesToRemove.isEmpty() && existingDeletesToRemove.isEmpty() && deletesToAdd.isEmpty();

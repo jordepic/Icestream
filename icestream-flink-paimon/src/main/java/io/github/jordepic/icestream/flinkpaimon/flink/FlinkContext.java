@@ -2,7 +2,6 @@ package io.github.jordepic.icestream.flinkpaimon.flink;
 
 import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 
 /**
  * Long-lived handle the master pod uses to spawn a Flink {@link StreamExecutionEnvironment} per
@@ -54,16 +53,23 @@ public final class FlinkContext implements AutoCloseable {
         return env;
     }
 
-    public StreamTableEnvironment newBatchTableEnv() {
-        return StreamTableEnvironment.create(newBatchEnv());
+    /**
+     * A fresh {@code STREAMING} env for the long-lived streaming converter. Unlike
+     * {@link #newBatchEnv}, the job this builds runs indefinitely (an unbounded source), keeping its
+     * operators — and Paimon's lookup-file cache — warm across conversions.
+     */
+    public StreamExecutionEnvironment newStreamEnv() {
+        StreamExecutionEnvironment env = switch (mode) {
+            case LOCAL -> StreamExecutionEnvironment.createLocalEnvironment(parallelism);
+            case REMOTE -> StreamExecutionEnvironment.createRemoteEnvironment(remoteHost, remotePort, jarFiles);
+        };
+        env.setParallelism(parallelism);
+        env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
+        return env;
     }
 
     @Override
-    public void close() {
-        // Nothing to release: createLocalEnvironment / createRemoteEnvironment don't allocate
-        // long-lived resources at the FlinkContext level. Per-env cleanup happens when each
-        // env's execute() returns.
-    }
+    public void close() {}
 
     private enum Mode {
         LOCAL,
