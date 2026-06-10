@@ -3,10 +3,9 @@ package io.github.jordepic.icestream.flinkpaimon.converter;
 import io.github.jordepic.icestream.flinkpaimon.index.IndexTableSchema;
 
 /**
- * Builds the Flink SQL that joins the eq-delete probe view to the Paimon index for the
- * {@link StreamingFlinkDeleteFileCreator}. The {@code FOR SYSTEM_TIME AS OF} temporal hint makes the
- * planner pick Paimon's {@code FileStoreLookupFunction} (an indexed point lookup) over a regular hash
- * join.
+ * Builds the Flink SQL that joins the eq-delete probe view to the Paimon index in the autonomous
+ * table job's convert branch. The {@code FOR SYSTEM_TIME AS OF} temporal hint makes the planner pick
+ * Paimon's {@code FileStoreLookupFunction} (an indexed point lookup) over a regular hash join.
  */
 final class LookupJoinSql {
 

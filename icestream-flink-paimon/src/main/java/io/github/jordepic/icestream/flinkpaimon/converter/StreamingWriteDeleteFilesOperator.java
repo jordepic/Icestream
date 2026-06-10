@@ -19,19 +19,18 @@ import org.apache.iceberg.SerializableTable;
  * subtasks never write the same one.
  *
  * <ul>
- *   <li>Input 1: {@code (data_file_path, ExistingPerFileDeletes)} from {@link RequestToExistingDeletes}
- *       — registered so the underlying writer merges the prior DV / file-scoped pos-delete into the
- *       new file it writes (and schedules the prior one for removal).
+ *   <li>Input 1: {@code (data_file_path, ExistingPerFileDeletes)} from
+ *       {@code WorkUnitToExistingDeletes} — registered so the underlying writer merges the prior DV /
+ *       file-scoped pos-delete into the new file it writes (and schedules the prior one for removal).
  *   <li>Input 2: {@code Row(spec_id, partition_key_hex, data_file_path, pos)} — match rows from the
  *       warm Paimon lookup join.
  * </ul>
  *
  * <p>Unlike the bounded batch writer, this one is long-lived: it flushes at the <b>checkpoint
  * barrier</b> ({@link #prepareSnapshotPreBarrier}) and <b>emits its slice's {@link TaskOutputs}
- * downstream</b> to the parallelism-1
- * {@link io.github.jordepic.icestream.flinkpaimon.channel.CollectConversionOutputsOperator}, which
- * aggregates all subtasks' slices for the epoch (barrier alignment guarantees it has received every
- * subtask's slice) and replies to the caller. Serial dispatch means one conversion per epoch, so
+ * downstream</b> to the parallelism-1 {@code RunCommitter}, which aggregates all subtasks' slices for
+ * the epoch (barrier alignment guarantees it has received every subtask's slice) and commits the
+ * conversion. One run per epoch (the source emits one per epoch), so
  * every existing-delete and match preceding the barrier belongs to that conversion; the order in
  * which the two inputs interleave does not matter because the merge happens at flush. The writer is
  * re-created for the next conversion (unique file names via {@code subtask} + an incrementing flush

@@ -1,10 +1,7 @@
 package io.github.jordepic.icestream.master;
 
-import io.github.jordepic.icestream.schema.IcestreamProperties;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -16,8 +13,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
-import org.apache.iceberg.catalog.Namespace;
-import org.apache.iceberg.catalog.SupportsNamespaces;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.slf4j.Logger;
@@ -117,7 +112,7 @@ public final class MasterLoop {
 
     private void pollOnce() {
         Instant now = Instant.now();
-        for (TableIdentifier id : enumerateIcestreamTables()) {
+        for (TableIdentifier id : IcestreamCatalogScan.icestreamTables(catalog)) {
             Instant cooldown = noWorkUntil.get(id);
             if (cooldown != null && cooldown.isAfter(now)) {
                 continue;
@@ -153,57 +148,6 @@ public final class MasterLoop {
             } finally {
                 active.remove(id);
             }
-        }
-    }
-
-    private List<TableIdentifier> enumerateIcestreamTables() {
-        List<TableIdentifier> out = new ArrayList<>();
-        for (Namespace ns : walkNamespaces()) {
-            try {
-                for (TableIdentifier id : catalog.listTables(ns)) {
-                    if (isIcestreamTable(id)) {
-                        out.add(id);
-                    }
-                }
-            } catch (Exception e) {
-                log.warn("Failed to list tables in namespace {}; skipping", ns, e);
-            }
-        }
-        return out;
-    }
-
-    private boolean isIcestreamTable(TableIdentifier id) {
-        try {
-            Table t = catalog.loadTable(id);
-            return t.properties().containsKey(IcestreamProperties.PRIMARY_KEYS);
-        } catch (NoSuchTableException e) {
-            return false;
-        } catch (Exception e) {
-            log.warn("Failed to load {} for icestream-property check; skipping this sweep", id, e);
-            return false;
-        }
-    }
-
-    private List<Namespace> walkNamespaces() {
-        if (!(catalog instanceof SupportsNamespaces sn)) {
-            return List.of();
-        }
-        List<Namespace> out = new ArrayList<>();
-        walkNamespaces(sn, Namespace.empty(), out);
-        return out;
-    }
-
-    private void walkNamespaces(SupportsNamespaces sn, Namespace parent, List<Namespace> out) {
-        List<Namespace> children;
-        try {
-            children = sn.listNamespaces(parent);
-        } catch (Exception e) {
-            log.warn("Failed to list children of {}; skipping subtree", parent, e);
-            return;
-        }
-        for (Namespace child : children) {
-            out.add(child);
-            walkNamespaces(sn, child, out);
         }
     }
 

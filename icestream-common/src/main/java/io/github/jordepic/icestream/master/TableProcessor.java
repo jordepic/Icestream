@@ -7,7 +7,6 @@ import io.github.jordepic.icestream.index.IndexBackend;
 import io.github.jordepic.icestream.indexer.DataIndexer;
 import io.github.jordepic.icestream.planner.DataFileRun;
 import io.github.jordepic.icestream.planner.EqualityDeleteFileRun;
-import io.github.jordepic.icestream.planner.FileKind;
 import io.github.jordepic.icestream.planner.FileRun;
 import io.github.jordepic.icestream.planner.SnapshotPlanner;
 import io.github.jordepic.icestream.planner.State;
@@ -79,7 +78,7 @@ public final class TableProcessor implements RunProcessor {
         long startNanos = System.nanoTime();
         try {
             applyRun(id, table, run, config);
-            commitWatermark(table, new State(run.maxSeq(), run.kind()), propsAtStart);
+            IcestreamWatermark.commit(table, new State(run.maxSeq(), run.kind()), propsAtStart);
             metrics.recordRunSuccess(id, run.kind(), fileCount, elapsedSince(startNanos));
             return true;
         } catch (RuntimeException | Error e) {
@@ -113,20 +112,6 @@ public final class TableProcessor implements RunProcessor {
     }
 
     private static State readState(Map<String, String> props) {
-        long seq = Long.parseLong(props.getOrDefault(IcestreamProperties.LAST_PROCESSED_SEQUENCE, "0"));
-        FileKind kind =
-                FileKind.valueOf(props.getOrDefault(IcestreamProperties.LAST_PROCESSED_KIND, FileKind.DATA.name()));
-        return new State(seq, kind);
-    }
-
-    private static void commitWatermark(Table table, State state, Map<String, String> propsAtStart) {
-        table.updateProperties()
-                .set(IcestreamProperties.LAST_PROCESSED_SEQUENCE, Long.toString(state.sequenceNumber()))
-                .set(IcestreamProperties.LAST_PROCESSED_KIND, state.fileKind().name())
-                .set(IcestreamProperties.PINNED_PRIMARY_KEYS, propsAtStart.get(IcestreamProperties.PRIMARY_KEYS))
-                .set(
-                        IcestreamProperties.PINNED_INDEX_BUCKETS,
-                        propsAtStart.getOrDefault(IcestreamProperties.INDEX_BUCKETS, "1"))
-                .commit();
+        return IcestreamWatermark.read(props);
     }
 }

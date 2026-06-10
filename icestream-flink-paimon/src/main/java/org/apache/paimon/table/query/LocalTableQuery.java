@@ -157,7 +157,18 @@ public class LocalTableQuery implements TableQuery {
         }
     }
 
+    /**
+     * icestream observability: counts cold per-(partition,bucket) lookup builds — i.e. cache misses
+     * where this query has to materialize a bucket's lookup levels (and download/rebuild its lookup
+     * ssts) rather than reuse the warm {@code tableView} entry. The whole point of the long-lived
+     * autonomous job is that this stays flat across conversions for a bucket already loaded; a test
+     * asserts exactly that ({@code LookupCacheWarmthTest}).
+     */
+    public static final java.util.concurrent.atomic.AtomicLong COLD_BUCKET_LOADS =
+            new java.util.concurrent.atomic.AtomicLong();
+
     private void newLookupLevels(BinaryRow partition, int bucket, List<DataFileMeta> dataFiles) {
+        COLD_BUCKET_LOADS.incrementAndGet();
         Levels levels = new Levels(keyComparatorSupplier.get(), dataFiles, options.numLevels());
         // TODO pass DeletionVector factory
         KeyValueFileReaderFactory factory =

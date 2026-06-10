@@ -7,14 +7,14 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# Flink execution mode for the single icestream process (one pod runs the polling control loop AND
-# owns the converter that drives the Flink job — there is no separate "worker" pod, no RPC hop):
-#   remote — production. Submits ONE standing streaming converter job to the Flink session cluster
-#            (managed below by flinkSessionCluster) and hosts the conversion channel server the
-#            cluster's TaskManagers dial back into for lookup work-in/results-out. All file reads and
-#            writes run distributed on the cluster; only the commit is centralized in this pod.
-#   local  — dev/small. Runs the converter on an in-pod MiniCluster (in-process channel, no session
-#            cluster, no channel server). Size the pod for the in-pod Flink (Paimon lookup) work.
+# Flink execution mode for the icestream launcher pod. The pod is a launcher/supervisor: it discovers
+# icestream tables and submits ONE long-lived autonomous Flink job per table. Each job walks the
+# planner, indexes into Paimon, converts eq-deletes, commits, and advances its own iceberg watermark —
+# there is no master control loop and no conversion channel server.
+#   remote — production. Submits the autonomous job(s) to the Flink session cluster (managed below by
+#            flinkSessionCluster). All compute runs distributed on the cluster.
+#   local  — dev/small. Runs the job(s) on an in-pod MiniCluster (no session cluster). Size the pod
+#            for the in-pod Flink (Paimon lookup) work.
 flinkMode: remote
 
 appConfig:
@@ -36,28 +36,22 @@ appConfig:
       # s3.secret-key: minio-pass
   flink:
     parallelism: 4
-    # The operator-managed JM service the icestream pod submits the standing job to (flinkMode=remote).
+    # Path inside the image to the shaded cluster job jar shipped to the session-cluster TaskManagers
+    # (ICESTREAM_FLINK_JARS, flinkMode=remote only). Built by the cluster-jar maven profile and copied
+    # into the jib image.
+    jarsPath: /app/job/icestream-cluster.jar
+    # The operator-managed JM service the icestream pod submits the autonomous job(s) to (remote mode).
     sessionCluster:
       name: icestream-flink-session
       jmHost: icestream-flink-session-rest
       jmPort: 8081
   icestream:
-    # streaming = one long-lived warm job (production). batch = a fresh job per conversion (testing).
-    converter: streaming
     pollIntervalSeconds: 10
     idleBackoffSeconds: 60
-    maxConcurrentTasks: 4
     streamingCheckpointMs: 2000
-    conversionTimeoutMs: 600000
-
-# Conversion channel server (flinkMode=remote only): the session cluster's TaskManagers dial back
-# here for the lookup work-in/results-out channel. Exposed as an in-cluster Service at the advertised
-# URL (the channel Service DNS).
-channel:
-  port: 8090
-  # Path inside the image to the shaded job jar shipped to the session-cluster TaskManagers
-  # (ICESTREAM_FLINK_JARS). Built by the cluster-jar maven profile and copied into the jib image.
-  flinkJars: /app/job/icestream-cluster.jar
+    # How long the in-job committer waits for a DATA run's Paimon index commit to land before
+    # advancing the iceberg watermark (ICESTREAM_PAIMON_COMMIT_TIMEOUT_MS).
+    paimonCommitTimeoutMs: 600000
 
 # The single icestream pod. In flinkMode=remote the heavy compute lives on the session cluster, so
 # this can be modest; in flinkMode=local size it for the in-pod Flink (Paimon lookup) work.

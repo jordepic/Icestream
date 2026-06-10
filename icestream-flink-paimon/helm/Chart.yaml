@@ -3,11 +3,12 @@ name: icestream-flink-paimon
 description: |
   icestream (Flink + Paimon backend) — async eq-delete to deletion-vector indexer
   for Iceberg. The secondary index lives in Paimon on the same object store as the
-  iceberg warehouse. A single pod runs the polling control loop and owns the
-  converter that drives the Flink job. flinkMode "remote" (production) submits one
-  standing streaming converter job to a flink-kubernetes-operator session cluster
-  and hosts the conversion channel the cluster's TaskManagers dial back into;
-  flinkMode "local" (dev) runs the converter on an in-pod MiniCluster.
+  iceberg warehouse. A single launcher pod discovers icestream tables and submits one
+  long-lived autonomous Flink job per table; each job indexes, converts, commits, and
+  advances its own iceberg watermark — there is no master control loop and no
+  conversion channel. flinkMode "remote" (production) submits the jobs to a
+  flink-kubernetes-operator session cluster; flinkMode "local" (dev) runs them on an
+  in-pod MiniCluster.
 type: application
 version: 1.0.0
 appVersion: "1.0-SNAPSHOT"

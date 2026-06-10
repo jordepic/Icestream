@@ -56,9 +56,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Direct filter-logic coverage for
- * {@link io.github.jordepic.icestream.converter.ExistingPerFileDeleteLoader#scanManifest} — the scan
- * {@link RequestToExistingDeletes} drives per conversion. Exercises the predicate matrix without a
- * Flink runtime: build a real iceberg snapshot, scan its delete manifests, and inspect what's emitted.
+ * {@link io.github.jordepic.icestream.converter.ExistingPerFileDeleteLoader#collect} — the scan the
+ * walk source runs per conversion. Exercises the predicate matrix without a Flink runtime: build a
+ * real iceberg snapshot, scan its delete manifests, and inspect what's emitted.
  */
 class ExistingPerFileDeleteScanTest {
 

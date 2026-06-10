@@ -15,8 +15,8 @@ import org.apache.paimon.table.Table;
 /**
  * Paimon-backed {@link IndexBackend}: maintains one Paimon primary-key table per iceberg table
  * inside a single Paimon database. Mirrors the surface of the Spark+Cassandra
- * {@code CassandraIndex} so callers (TableProcessor, FlinkDataFileIndexer,
- * StreamingFlinkDeleteFileCreator) barely change shape.
+ * {@code CassandraIndex}; the autonomous table job uses it for both the index sink and the
+ * committer's commit-confirmation read.
  *
  * <p>Iceberg table identifiers can contain dots (separating namespaces from the table name);
  * Paimon identifiers are flat {@code (database, table)} pairs, so dots and other non-ident

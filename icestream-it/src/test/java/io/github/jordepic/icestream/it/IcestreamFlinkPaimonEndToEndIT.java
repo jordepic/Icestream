@@ -3,16 +3,13 @@ package io.github.jordepic.icestream.it;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.jordepic.icestream.converter.ConversionCommitter;
-import io.github.jordepic.icestream.converter.DeleteConverter;
-import io.github.jordepic.icestream.flinkpaimon.converter.StreamingFlinkDeleteFileCreator;
 import io.github.jordepic.icestream.flinkpaimon.flink.FlinkContext;
 import io.github.jordepic.icestream.flinkpaimon.index.PaimonIndex;
-import io.github.jordepic.icestream.flinkpaimon.indexer.FlinkDataFileIndexer;
-import io.github.jordepic.icestream.master.IcestreamMetrics;
-import io.github.jordepic.icestream.master.MasterLoop;
-import io.github.jordepic.icestream.master.TableProcessor;
-import io.github.jordepic.icestream.planner.SnapshotPlanner;
+import io.github.jordepic.icestream.flinkpaimon.job.IcebergCatalogSpec;
+import io.github.jordepic.icestream.flinkpaimon.job.IcestreamTableJob;
+import io.github.jordepic.icestream.flinkpaimon.job.PaimonIndexSpec;
 import io.github.jordepic.icestream.schema.IcestreamProperties;
+import io.github.jordepic.icestream.schema.IcestreamTableConfig;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -36,6 +33,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.flink.core.execution.JobClient;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.CloseableIterable;
@@ -67,10 +65,11 @@ import org.testcontainers.utility.MountableFile;
  * from a Flink upsert SQL job submitted to the testcontainers Flink (this is unchanged — that's
  * how the test gets eq-deletes into the iceberg table).
  *
- * <p>The icestream master runs in-process. Its Flink batch jobs run in an in-pod
+ * <p>icestream runs as one long-lived autonomous {@link IcestreamTableJob} on an in-pod
  * {@link FlinkContext#local} MiniCluster (separate JVM Flink runtime from the testcontainers one
- * driving ingestion). The Paimon catalog uses a filesystem layout on the same MinIO bucket as
- * the iceberg warehouse.
+ * driving ingestion); its source/committer reach the REST catalog directly. The Paimon catalog uses
+ * a filesystem layout on the same MinIO bucket as the iceberg warehouse. There is no master loop and
+ * no conversion channel.
  *
  * <p>Assertion: every snapshot tagged {@code icestream-converted=true} has the same row set as
  * its parent (the no-op invariant — icestream's commits don't change visible state).
@@ -217,33 +216,47 @@ class IcestreamFlinkPaimonEndToEndIT {
             waitForFlinkJobRunning();
 
             try (FlinkContext flink = FlinkContext.local(2)) {
-                PaimonIndex paimonIndex = PaimonIndex.create(
-                        "s3://" + S3_BUCKET + "/paimon/", "icestream", paimonOptions());
+                String paimonWarehouse = "s3://" + S3_BUCKET + "/paimon/";
+                PaimonIndex paimonIndex = PaimonIndex.create(paimonWarehouse, "icestream", paimonOptions());
+                paimonIndex.initializeForTable(TABLE_ID, IcestreamTableConfig.from(catalog.loadTable(TABLE_ID)));
 
-                try (StreamingFlinkDeleteFileCreator converter =
-                        new StreamingFlinkDeleteFileCreator(flink, paimonIndex, 500, 120_000)) {
-                    KafkaJsonProducer producerRunnable = new KafkaJsonProducer(
-                            kafka.getBootstrapServers(),
-                            KAFKA_TOPIC,
-                            100,
-                            RUN_DURATION,
-                            Duration.ofMillis(20),
-                            42L);
-                    Thread producerThread = new Thread(producerRunnable, "icestream-it-producer");
-                    producerThread.setDaemon(true);
-                    producerThread.start();
+                IcebergCatalogSpec catalogSpec =
+                        new IcebergCatalogSpec("org.apache.iceberg.rest.RESTCatalog", "icestream-it", catalogProps());
+                PaimonIndexSpec indexSpec = new PaimonIndexSpec(paimonWarehouse, "icestream", paimonOptions());
 
-                    MasterLoop loop = newMasterLoop(catalog, flink, paimonIndex, converter);
-                    Thread loopThread = new Thread(loop::run, "icestream-it-master");
-                    loopThread.setDaemon(true);
-                    loopThread.start();
+                KafkaJsonProducer producerRunnable = new KafkaJsonProducer(
+                        kafka.getBootstrapServers(),
+                        KAFKA_TOPIC,
+                        100,
+                        RUN_DURATION,
+                        Duration.ofMillis(20),
+                        42L);
+                Thread producerThread = new Thread(producerRunnable, "icestream-it-producer");
+                producerThread.setDaemon(true);
+                producerThread.start();
 
-                    Thread.sleep(RUN_DURATION.toMillis());
+                // One long-lived autonomous job walks the planner, indexes, converts, and commits —
+                // no master loop, no channel. Same JVM MiniCluster reaches the REST catalog directly.
+                JobClient job = IcestreamTableJob.submit(
+                        flink,
+                        paimonIndex,
+                        catalogSpec,
+                        indexSpec,
+                        TABLE_ID,
+                        catalog.loadTable(TABLE_ID),
+                        2_000,
+                        ICESTREAM_POLL.toMillis(),
+                        ICESTREAM_IDLE_BACKOFF.toMillis(),
+                        120_000);
 
-                    producerRunnable.stop();
-                    producerThread.join(Duration.ofSeconds(5).toMillis());
-                    loop.stop();
-                    loopThread.join(Duration.ofSeconds(10).toMillis());
+                Thread.sleep(RUN_DURATION.toMillis());
+
+                producerRunnable.stop();
+                producerThread.join(Duration.ofSeconds(5).toMillis());
+                try {
+                    job.cancel().get(Duration.ofSeconds(30).toSeconds(), java.util.concurrent.TimeUnit.SECONDS);
+                } catch (Exception ignored) {
+                    // best-effort
                 }
 
                 paimonIndex.catalog().close();
@@ -298,17 +311,6 @@ class IcestreamFlinkPaimonEndToEndIT {
     }
 
     private record RowKey(long id, String name, long ts) {}
-
-    private static MasterLoop newMasterLoop(
-            RESTCatalog catalog, FlinkContext flink, PaimonIndex paimonIndex, DeleteConverter converter) {
-        TableProcessor processor = new TableProcessor(
-                new SnapshotPlanner(),
-                new FlinkDataFileIndexer(flink, paimonIndex),
-                converter,
-                paimonIndex,
-                IcestreamMetrics.NOOP);
-        return new MasterLoop(catalog, processor, ICESTREAM_POLL, ICESTREAM_IDLE_BACKOFF, 2);
-    }
 
     private static void createKafkaTopic() throws Exception {
         Map<String, Object> props = new HashMap<>();
@@ -374,7 +376,7 @@ class IcestreamFlinkPaimonEndToEndIT {
         return StreamSupport.stream(table.snapshots().spliterator(), false).count();
     }
 
-    private static RESTCatalog newCatalog() {
+    private static Map<String, String> catalogProps() {
         Map<String, String> props = new HashMap<>();
         props.put(CatalogProperties.URI, "http://" + rest.getHost() + ":" + rest.getMappedPort(8181));
         props.put(CatalogProperties.WAREHOUSE_LOCATION, "s3://" + S3_BUCKET + "/");
@@ -384,8 +386,12 @@ class IcestreamFlinkPaimonEndToEndIT {
         props.put("s3.access-key-id", AWS_ACCESS_KEY);
         props.put("s3.secret-access-key", AWS_SECRET_KEY);
         props.put("client.region", "us-east-1");
+        return props;
+    }
+
+    private static RESTCatalog newCatalog() {
         RESTCatalog catalog = new RESTCatalog();
-        catalog.initialize("icestream-it", props);
+        catalog.initialize("icestream-it", catalogProps());
         return catalog;
     }
 

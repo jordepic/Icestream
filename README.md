@@ -11,8 +11,11 @@ shipping backends.
 ## Backends
 
 Two production-ready implementations live under one repo, sharing the planner,
-master loop, conversion committer, and per-task delete-file writers via a
-common module. Each backend picks index storage + compute engine differently:
+if the jobconversion committer, and per-task delete-file writers via a common module.
+Each backend picks index storage + compute engine differently — and drives the
+work differently: Spark + Cassandra runs a shared master control loop in the
+driver pod, while Flink + Paimon runs one long-lived autonomous job per table
+(see [`STREAMING_CONVERTER.md`](STREAMING_CONVERTER.md)):
 
 | | `icestream-spark-cassandra` | `icestream-flink-paimon` |
 |---|---|---|
@@ -20,8 +23,8 @@ common module. Each backend picks index storage + compute engine differently:
 | **Compute engine** | Apache Spark | Apache Flink (DataStream + Table API) |
 | **Indexer write** | `repartitionByCassandraReplica` + token-aware upserts via the Spark Cassandra connector | Flink batch sink (`FlinkSinkBuilder.forRowData`) into the Paimon PK table; Paimon writer auto-compacts |
 | **Eq-delete join** | Replica-aware repartition + `joinWithCassandraTable` (per-row predicate-pushed lookup) | Flink Table API `LEFT JOIN ... FOR SYSTEM_TIME AS OF eq.proc` against the Paimon catalog — planner picks Paimon's `FileStoreLookupFunction` for per-row indexed nested-loop probes via the `.lookup` SST sidecars |
-| **Delete-file write** | On Spark executors via `mapPartitions(WriteDvFiles)` / `WritePosDeleteFiles` | On Flink TaskManagers via the `WriteDeleteFilesOperator` (`BoundedOneInput`) |
-| **Deployment** | Spark-on-k8s with the master pod as the long-lived driver | Master pod + a long-lived Flink session cluster (`FlinkDeployment` CR managed by `flink-kubernetes-operator`); master submits per-fileRun jobs via `RestClusterClient` |
+| **Delete-file write** | On Spark executors via `mapPartitions(WriteDvFiles)` / `WritePosDeleteFiles` | On Flink TaskManagers via the `StreamingWriteDeleteFilesOperator`, keyed by `data_file_path`; each subtask flushes its slice at the checkpoint barrier |
+| **Deployment** | Spark-on-k8s with the master pod as the long-lived driver | Launcher pod + a long-lived Flink session cluster (`FlinkDeployment` CR managed by `flink-kubernetes-operator`); the launcher submits one long-lived autonomous job per table via `RestClusterClient` and restarts any that die |
 
 Both backends produce identical iceberg side effects — the same `RowDelta`
 shape, snapshot summaries tagged `icestream-converted=true`, and the same
@@ -117,6 +120,14 @@ snapshot summary.
 
 ## Architecture
 
+The two backends share the planner, conversion committer, and per-task delete-file writers, but drive
+them differently. **Spark + Cassandra** uses a shared master control loop in the driver pod;
+**Flink + Paimon** does not — its launcher pod only submits one long-lived autonomous job per table to
+a Flink session cluster, and each job is self-driving (its source walks the planner, its committer
+commits and advances the watermark; see [`STREAMING_CONVERTER.md`](STREAMING_CONVERTER.md)).
+
+### Spark + Cassandra: shared master loop
+
 ```
                       ┌────────────────────────────────────┐
                       │  Iceberg REST catalog (S3/MinIO)   │
@@ -125,38 +136,61 @@ snapshot summary.
                   loadTable() │                │ RowDelta commit
                               │                │
         ┌─────────────────────┴────────────────┴──────────────────────┐
-        │  icestream master                                           │
+        │  icestream master (in-pod Spark driver)                      │
         │                                                             │
         │   MasterLoop ──► TableProcessor (one run per call)          │
         │                  │                                          │
         │                  ├─ SnapshotPlanner    (kind-homogeneous   │
         │                  │                      runs over the walk) │
         │                  │                                          │
-        │                  ├─ DataIndexer        (Spark or Flink)    │
+        │                  ├─ DataIndexer        (Spark)             │
         │                  │                                          │
-        │                  └─ DeleteConverter    (Spark or Flink)    │
+        │                  └─ DeleteConverter    (Spark)             │
         │                                                             │
         └──────────────────────────────────┬──────────────────────────┘
                                            │
-                       backend-specific compute + storage:
-                                           │
-       ┌───────────────────────────────────┴───────────────────────────────┐
-       │                                                                   │
-       ▼ (icestream-spark-cassandra)                  (icestream-flink-paimon) ▼
-┌───────────────────────┐                              ┌────────────────────────────────┐
-│  Spark cluster        │                              │  Flink session cluster (k8s    │
-│  (SparkSession,       │                              │   operator-managed)            │
-│   in-pod driver)      │                              │   master submits per-fileRun   │
-│                       │                              │   batch jobs via REST          │
-│  ┌─────────────────┐  │                              │  ┌──────────────────────────┐  │
-│  │ Cassandra       │  │                              │  │ Paimon catalog           │  │
-│  │ (LOCAL_QUORUM)  │  │                              │  │  (filesystem on S3/MinIO,│  │
-│  │  one CQL table  │  │                              │  │   one PK table per       │  │
-│  │  per iceberg    │  │                              │  │   iceberg table)         │  │
-│  │  table          │  │                              │  └──────────────────────────┘  │
-│  └─────────────────┘  │                              │       (data + .lookup SSTs)    │
-└───────────────────────┘                              └────────────────────────────────┘
+                       ┌───────────────────┴───────────────────┐
+                       │  Cassandra (LOCAL_QUORUM)              │
+                       │   one CQL table per iceberg table      │
+                       └────────────────────────────────────────┘
 ```
+
+### Flink + Paimon: launcher + one autonomous job per table
+
+```
+                      ┌────────────────────────────────────┐
+                      │  Iceberg REST catalog (S3/MinIO)   │
+                      └────────────────────────────────────┘
+                          ▲   ▲                    ▲
+              discover  ──┘   │ loadTable()        │ RowDelta commit /
+              icestream       │ (in the job)       │ watermark (in the job)
+              tables          │                    │
+        ┌───────────────┐     │                    │
+        │  launcher pod │ ── submits/restarts ──┐   │
+        │  (FlinkMain)  │   one job per table   │   │
+        └───────────────┘                       ▼   │
+                          ┌─────────────────────────┴──────────────────┐
+                          │  Flink session cluster (k8s operator-managed)│
+                          │                                            │
+                          │   IcestreamTableJob (per table):           │
+                          │     IcestreamWalkSource (p1, the loop)     │
+                          │       ├─ DATA  → Paimon PK-index upsert     │
+                          │       └─ EQ_DEL → warm lookup join →        │
+                          │                   distributed DV/pos writes │
+                          │     RunCommitter (p1) → commit + watermark  │
+                          │                                            │
+                          │   ┌──────────────────────────┐             │
+                          │   │ Paimon catalog            │             │
+                          │   │  (filesystem on S3/MinIO, │             │
+                          │   │   one PK table per table) │             │
+                          │   └──────────────────────────┘             │
+                          │        (data + .lookup SSTs)               │
+                          └────────────────────────────────────────────┘
+```
+
+The launcher only discovers tables and keeps one job per table submitted and alive; it does **not**
+drive index/convert work and there is no RPC channel — the source and committer coordinate through
+committed store state (the iceberg watermark + the Paimon snapshot).
 
 ### Index schema
 
@@ -190,13 +224,13 @@ the same avro `StructLike` byte representation, computed in
 
 #### Lookup-cache tuning (Flink + Paimon)
 
-This cache only earns its keep because the Flink converter is **one long-lived streaming job**, not a
-fresh job per conversion. The per-bucket `.lookup` SSTs are materialized (or downloaded, with remote
-lookup files) and their pages warmed *once*, then reused across every conversion the standing job
-serves; a job-per-conversion would re-pay that cold start each time — the SST download dominates
-(~5–25× slower in benchmarks; see [Benchmark](#benchmark-flink--paimon-distributed-cluster)) — and
-throw the warm cache away between runs. That's the core reason the converter is a standing job: the
-toggles below govern a cache that persists for the life of the job.
+This cache only earns its keep because each table's Flink job is **one long-lived autonomous job**,
+not a fresh job per run. The per-bucket `.lookup` SSTs are materialized (or downloaded, with remote
+lookup files) and their pages warmed *once*, then reused across every run the standing job serves; a
+job-per-run would re-pay that cold start each time — the SST download dominates (~5–25× slower in
+benchmarks; see [Benchmark](#benchmark-flink--paimon-distributed-cluster)) — and throw the warm cache
+away between runs. That's the core reason the job is long-lived: the toggles below govern a cache that
+persists for the life of the job.
 
 The lookup join materializes per-bucket `.lookup` SST sidecars on the TaskManager's local disk and
 caches their pages in memory. Three Paimon toggles control how much stays resident vs. gets paged
@@ -215,11 +249,12 @@ in/out (set them as index-table options):
 
 - **Async + persistent index**: amortize indexing over time; conversions
   become indexed lookups instead of full data-file rescans.
-- **Two backends sharing one core**: planner, master loop, conversion
-  committer, and per-task delete-file writers (`PerTaskDvWriter`,
-  `PerTaskPosDeleteWriter`) live in `icestream-common`. Backends only
-  differ in how they connect compute to index storage. New backends slot
-  in by implementing `IndexBackend` + `DataIndexer` + `DeleteConverter`.
+- **Two backends sharing one core**: planner, conversion committer, and
+  per-task delete-file writers (`PerTaskDvWriter`, `PerTaskPosDeleteWriter`)
+  live in `icestream-common`. Backends differ in how they connect compute to
+  index storage and how they drive the walk — Spark + Cassandra uses the shared
+  master loop; Flink + Paimon's source/committer drive their own walk inside
+  each autonomous job.
 - **Engine-native indexed-NL join**:
   - Spark+Cassandra: the connector pushes the partition+pk equality into a
     Cassandra lookup, so Spark's stage is a stream of indexed point-probes,
@@ -235,8 +270,8 @@ in/out (set them as index-table options):
 These are the load-bearing choices the codebase commits to.
 
 1. **Multi-impl module split.** `icestream-common` holds engine-agnostic
-   logic (planner, schema, master loop, iceberg readers, conversion
-   committer, `PerTaskDvWriter`/`PerTaskPosDeleteWriter`,
+   logic (planner, schema, the master loop used by the Spark backend, iceberg
+   readers, conversion committer, `PerTaskDvWriter`/`PerTaskPosDeleteWriter`,
    `DeleteFileCreatorSupport`, `FileWorkItem`, `EnvConfig`,
    `LifecycleHooks`). The two backends implement common interfaces
    (`IndexBackend`, `DataIndexer`, `DeleteConverter`).
@@ -248,17 +283,23 @@ These are the load-bearing choices the codebase commits to.
    string. Hex is byte-order-preserving and path-safe.
 4. **Paimon table partitioned by `(spec_id, partition_key)`** so the lookup
    join prunes to the matching iceberg partition per probe row.
-5. **Driver-collect of `TaskOutputs`, not match rows**: per-data-file
-   delete files are written on TaskManagers via `WriteDeleteFilesOperator`;
-   only the `TaskOutputs` (one per task slot) make it back to the master
-   pod, where `DeleteFileCreatorSupport.assemblePlan` produces the
-   `CommitPlan`.
+5. **In-cluster collect of `TaskOutputs`, not match rows**: per-data-file
+   delete files are written on TaskManagers via
+   `StreamingWriteDeleteFilesOperator`; only the `TaskOutputs` (one per writer
+   subtask) flow to the job's parallelism-1 `RunCommitter`, where
+   `DeleteFileCreatorSupport.assemblePlan` produces the `CommitPlan`. The
+   commit and watermark advance happen inside the job, not in a driver.
 6. **Flink runtime: session mode on k8s via `flink-kubernetes-operator`.**
-   Application mode (one cluster per fileRun) would dominate runtime with
-   cluster-startup. Per-job submission against a long-lived session cluster
-   is ~1-2 s; matches the master's 10 s polling cadence.
-7. **Master pod is external to the Flink cluster**, talks via REST.
-   Mirrors the Spark backend's external-driver-pod shape.
+   Application mode (one cluster per table) would dominate runtime with
+   cluster-startup. The launcher submits one long-lived autonomous job per
+   table to a shared session cluster and only resubmits a job if it dies.
+7. **Autonomous job, no central driver or RPC channel.** Each table's job is
+   self-driving: a parallelism-1 source walks the planner and emits one run per
+   checkpoint epoch, gated on the iceberg watermark; the parallelism-1
+   committer commits and advances that watermark. Source and committer
+   coordinate only through committed store state (iceberg watermark + Paimon
+   snapshot) — there is no master loop driving the work and no dial-back
+   channel. The launcher pod makes only outbound connections.
 8. **Greenfield deployment assumed**: no Cassandra → Paimon migration
    tooling; pick a backend and stick with it.
 
@@ -304,31 +345,34 @@ Read once at startup. Iceberg catalog comes from the SparkSession via
 Per-table-only knob: `icestream.cassandra-partitions-per-host` (Spark write
 partitions per Cassandra replica, default `10`).
 
-### Flink + Paimon master process (env vars)
+### Flink + Paimon launcher (env vars)
 
-The iceberg catalog is built directly via `CatalogUtil.loadCatalog`. Free-form
-catalog options arrive as `ICESTREAM_ICEBERG_OPT_*` / `ICESTREAM_PAIMON_OPT_*`
-env vars (key normalization: lowercase, `_` → `.`).
+Read once at startup by `FlinkMain`. The iceberg catalog is built directly via
+`CatalogUtil.loadCatalog`. Free-form catalog options arrive as
+`ICESTREAM_ICEBERG_OPT_*` / `ICESTREAM_PAIMON_OPT_*` env vars (key
+normalization: lowercase, `_` → `.`).
 
-| Variable                                  | Required | Default     |
-|-------------------------------------------|----------|-------------|
-| `ICESTREAM_ICEBERG_REST_URI`              | yes      | —           |
-| `ICESTREAM_ICEBERG_WAREHOUSE`             | yes      | —           |
-| `ICESTREAM_ICEBERG_OPT_*`                 | no       | —           |
-| `ICESTREAM_PAIMON_WAREHOUSE`              | yes      | —           |
-| `ICESTREAM_PAIMON_DATABASE`               | no       | `icestream` |
-| `ICESTREAM_PAIMON_OPT_*`                  | no       | —           |
-| `ICESTREAM_FLINK_MODE`                    | no       | `local`     |
-| `ICESTREAM_FLINK_JM_HOST`                 | no       | `localhost` |
-| `ICESTREAM_FLINK_JM_PORT`                 | no       | `8081`      |
-| `ICESTREAM_FLINK_PARALLELISM`             | no       | `4`         |
-| `ICESTREAM_POLL_INTERVAL_SECONDS`         | no       | `10`        |
-| `ICESTREAM_IDLE_BACKOFF_SECONDS`          | no       | `60`        |
-| `ICESTREAM_MAX_CONCURRENT_TASKS`          | no       | `4`         |
+| Variable                                  | Required | Default     | Meaning                                                  |
+|-------------------------------------------|----------|-------------|----------------------------------------------------------|
+| `ICESTREAM_ICEBERG_REST_URI`              | yes      | —           | REST catalog URI.                                        |
+| `ICESTREAM_ICEBERG_WAREHOUSE`             | yes      | —           | Iceberg warehouse location.                              |
+| `ICESTREAM_ICEBERG_OPT_*`                 | no       | —           | Free-form iceberg catalog options.                       |
+| `ICESTREAM_PAIMON_WAREHOUSE`              | yes      | —           | Paimon index warehouse.                                  |
+| `ICESTREAM_PAIMON_DATABASE`               | no       | `icestream` | Paimon database for the index tables.                    |
+| `ICESTREAM_PAIMON_OPT_*`                  | no       | —           | Free-form Paimon catalog options.                        |
+| `ICESTREAM_FLINK_MODE`                    | no       | `local`     | `local` (in-pod `MiniCluster`) or `remote` (session cluster). |
+| `ICESTREAM_FLINK_JM_HOST`                 | no       | `localhost` | JobManager host (`remote`).                              |
+| `ICESTREAM_FLINK_JM_PORT`                 | no       | `8081`      | JobManager REST port (`remote`).                         |
+| `ICESTREAM_FLINK_PARALLELISM`             | no       | `4`         | Parallelism of each autonomous job's distributed stages. |
+| `ICESTREAM_FLINK_JARS`                    | no       | —           | Comma-separated shaded job jars shipped to the cluster (`remote`). |
+| `ICESTREAM_STREAMING_CHECKPOINT_MS`       | no       | `2000`      | Checkpoint interval; one run is bracketed per checkpoint epoch. |
+| `ICESTREAM_PAIMON_COMMIT_TIMEOUT_MS`      | no       | `600000`    | How long the committer waits for the Paimon index snapshot to advance after a DATA run before proceeding. |
+| `ICESTREAM_POLL_INTERVAL_SECONDS`         | no       | `10`        | Launcher discovery sweep + the source's watermark-gate poll. |
+| `ICESTREAM_IDLE_BACKOFF_SECONDS`          | no       | `60`        | The source's backoff when the planner has no work.      |
 
 `ICESTREAM_FLINK_MODE=local` runs an in-pod `MiniCluster` (used by IT and
-dev). `remote` submits via `RestClusterClient` to a long-lived session
-cluster.
+dev). `remote` submits each autonomous job via `RestClusterClient` to a
+long-lived session cluster.
 
 ## Helm charts
 
@@ -353,24 +397,25 @@ helm install icestream-flink-paimon ./icestream-flink-paimon/helm \
   --set appConfig.paimon.warehouse=s3://warehouse/paimon/
 ```
 
-The chart deploys a **single icestream pod** — one process runs the polling
-control loop *and* owns the converter that drives the Flink job (there is no
-separate "worker" pod and no RPC hop). The `--set flinkMode=…` axis picks where
-the Flink job runs:
+The chart deploys a **single icestream pod** running `FlinkMain` as a
+launcher/supervisor — it discovers icestream tables and submits one long-lived
+autonomous job per table, restarting any that die. There is no master control
+loop, no separate "worker" pod, and no RPC channel; the pod makes only outbound
+connections (REST catalog, object store, JobManager). The `--set flinkMode=…`
+axis picks where the autonomous jobs run:
 
-- **`remote`** (default, production): the pod submits one standing streaming
-  converter job to a Flink session cluster (`FLINK_MODE=remote`) and hosts the
-  conversion **channel server** on port 8090; the cluster's TaskManagers dial
-  back to the pod's `Service` for the lookup work-in/results-out channel — so the
-  channel's advertised URL is its in-cluster Service DNS. The chart also
-  provisions a `FlinkDeployment` CR (`flink-kubernetes-operator` must be
-  installed cluster-wide). All file reads and writes run distributed on the
-  cluster; only the commit is centralized in the pod. Set
+- **`remote`** (default, production): the launcher submits one autonomous job
+  per table to a Flink session cluster (`FLINK_MODE=remote`) over the
+  JobManager's REST endpoint. Each job is self-driving — its parallelism-1
+  source walks the planner, the DATA/EQ_DEL branches run distributed reads and
+  writes across the cluster, and its parallelism-1 committer commits and
+  advances the iceberg watermark. The chart provisions a `FlinkDeployment` CR
+  (`flink-kubernetes-operator` must be installed cluster-wide). No inbound port
+  and no Service to dial back into. Set
   `--set flinkSessionCluster.enabled=false` to point at a pre-existing
   `FlinkDeployment` (configure `appConfig.flink.sessionCluster.*`).
-- **`local`** (dev/small): a single pod running the control loop + an in-pod
-  `MiniCluster` (`FLINK_MODE=local`). No session cluster, no channel server,
-  in-process transport.
+- **`local`** (dev/small): a single pod running the launcher + an in-pod
+  `MiniCluster` (`FLINK_MODE=local`). No session cluster.
 
 In `remote` mode the **image must contain the shaded job jar** it ships to the
 TaskManagers (`ICESTREAM_FLINK_JARS=/app/job/icestream-cluster.jar`). Build it
@@ -392,8 +437,9 @@ These are deliberate v1 simplifications, not permanent constraints.
 - **Only fully-convertible eq-deletes are processed.** Schema mismatches or
   unpartitioned eq-deletes in partitioned tables are skipped silently and
   stay in the table.
-- **Single-process master.** Horizontal scale-out (sharding tables across
-  master instances) is not implemented.
+- **Single launcher / master process.** Horizontal scale-out (sharding tables
+  across instances) is not implemented — the Spark backend runs one master, and
+  the Flink backend runs one launcher pod that supervises all per-table jobs.
 
 ## Tests
 
@@ -415,7 +461,7 @@ These are deliberate v1 simplifications, not permanent constraints.
 
 > **The `ConversionBenchmark` harness and the batch (full-scan) control converter live on the
 > [`benchmarking`](https://github.com/jordepic/Icestream/tree/benchmarking) branch, not on `main`** —
-> `main` ships only the production streaming converter. The results below were produced on that branch
+> `main` ships only the production autonomous per-table job. The results below were produced on that branch
 > and are kept here as design justification; the `mvn -Pbenchmark` invocations apply to that branch.
 
 `ConversionBenchmark` (in `icestream-it`, `@Tag("benchmark")`) times the warm indexed
@@ -464,9 +510,7 @@ cache sizes vs the batch-join baseline:
   subtask here — not the full ~2.35 GB SST slice. **Size the cache to the hot set, not the footprint.**
 - **Small D is cache-insensitive** (D≤1k touch few SSTs); the cache only matters at the big-D paging
   end, where a too-small (256 MB) cache thrashes against the 9.4 GB SST set and can hand D=1M to batch.
-- **Flake-free at every cache size.** The converter's channel transport is hardened against the
-  long-poll connection resets that previously restarted the standing job and lost conversions; the
-  correctness invariant (positions = D) held on every point.
+- **Flake-free at every cache size.** The correctness invariant (positions = D) held on every point.
 
 **Index data-file format.** The data files are parquet + zstd (Paimon defaults). The format is
 independent of lookup speed — the lookup probes the separate, format-agnostic `.lookup` SSTs — but it
@@ -495,6 +539,5 @@ Notes:
 - `lookupMemCache` is **per lookup subtask** (2 subtasks/TM at parallelism 4), so size the TaskManager
   heap to hold it. A literal zero-/sub-page cache is degenerate (returns wrong results); the smallest
   meaningful value is ≥ a cache page, and ~1 GB/subtask saturates the hot set at this scale.
-- These numbers are flake-free thanks to the hardened channel transport (the source's long-poll retries
-  transient connection resets instead of failing the task and restarting the standing job).
+- These numbers are flake-free; the correctness invariant `positions = D` was checked on every point.
 

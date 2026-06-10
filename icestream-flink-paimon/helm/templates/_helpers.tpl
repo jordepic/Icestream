@@ -40,12 +40,6 @@ app.kubernetes.io/name: {{ include "icestream.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
-{{/* Conversion-channel Service name + URL. In flinkMode=remote the session-cluster TaskManagers
-     reach the icestream pod's channel server (lookup work-in/results-out) through this Service. */}}
-{{- define "icestream.channelServiceName" -}}
-{{- printf "%s-channel" (include "icestream.fullname" .) | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
 {{/* Iceberg + Paimon catalog env. Include with nindent. */}}
 {{- define "icestream.catalogEnv" -}}
 - name: ICESTREAM_ICEBERG_REST_URI

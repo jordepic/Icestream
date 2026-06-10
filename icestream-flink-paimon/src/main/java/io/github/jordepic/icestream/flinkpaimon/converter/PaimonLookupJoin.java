@@ -18,7 +18,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.types.Types.NestedField;
 
 /**
- * Shared Flink+Paimon lookup-join wiring for the {@link StreamingFlinkDeleteFileCreator}: registers
+ * Shared Flink+Paimon lookup-join wiring for the autonomous table job's convert branch: registers
  * the Paimon catalog, the probe types, and turns a stream of probe rows {@code (spec_id,
  * partition_key, pk)} into the lookup matches {@code (spec_id, partition_key, data_file_path, pos)}
  * via {@link LookupJoinSql}.
