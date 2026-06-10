@@ -5,30 +5,30 @@ Asynchronous secondary-index service that efficiently converts Apache Iceberg
 **deletion vectors** for V3 tables, **positional delete files** for V2 tables —
 without blocking the writer that produced them. The format is picked per-table
 from `format-version`. The conversion leverages a distributed index of iceberg
-data files; the index storage and compute engine are pluggable, with two
-shipping backends.
+data files, built on **Apache Flink** for compute and **Apache Paimon** for
+index storage.
 
-## Backends
+## Design
 
-Two production-ready implementations live under one repo, sharing the planner,
-if the jobconversion committer, and per-task delete-file writers via a common module.
-Each backend picks index storage + compute engine differently — and drives the
-work differently: Spark + Cassandra runs a shared master control loop in the
-driver pod, while Flink + Paimon runs one long-lived autonomous job per table
-(see [`STREAMING_CONVERTER.md`](STREAMING_CONVERTER.md)):
+A single Flink + Paimon system. The secondary index is an Apache Paimon
+primary-key table on the same object store as the iceberg warehouse (one PK
+table per iceberg table); compute runs on Apache Flink (DataStream + Table API).
+The work is driven by one long-lived **autonomous job per table** rather than a
+central control loop (see [`STREAMING_CONVERTER.md`](STREAMING_CONVERTER.md)):
 
-| | `icestream-spark-cassandra` | `icestream-flink-paimon` |
-|---|---|---|
-| **Index storage** | Apache Cassandra (one CQL table per iceberg table) | Apache Paimon primary-key table on the same object store as the iceberg warehouse |
-| **Compute engine** | Apache Spark | Apache Flink (DataStream + Table API) |
-| **Indexer write** | `repartitionByCassandraReplica` + token-aware upserts via the Spark Cassandra connector | Flink batch sink (`FlinkSinkBuilder.forRowData`) into the Paimon PK table; Paimon writer auto-compacts |
-| **Eq-delete join** | Replica-aware repartition + `joinWithCassandraTable` (per-row predicate-pushed lookup) | Flink Table API `LEFT JOIN ... FOR SYSTEM_TIME AS OF eq.proc` against the Paimon catalog — planner picks Paimon's `FileStoreLookupFunction` for per-row indexed nested-loop probes via the `.lookup` SST sidecars |
-| **Delete-file write** | On Spark executors via `mapPartitions(WriteDvFiles)` / `WritePosDeleteFiles` | On Flink TaskManagers via the `StreamingWriteDeleteFilesOperator`, keyed by `data_file_path`; each subtask flushes its slice at the checkpoint barrier |
-| **Deployment** | Spark-on-k8s with the master pod as the long-lived driver | Launcher pod + a long-lived Flink session cluster (`FlinkDeployment` CR managed by `flink-kubernetes-operator`); the launcher submits one long-lived autonomous job per table via `RestClusterClient` and restarts any that die |
-
-Both backends produce identical iceberg side effects — the same `RowDelta`
-shape, snapshot summaries tagged `icestream-converted=true`, and the same
-crash semantics.
+- **Indexer write** — a Flink batch sink (`FlinkSinkBuilder.forRowData`) upserts
+  data-file rows into the Paimon PK table; the Paimon writer auto-compacts.
+- **Eq-delete join** — a Flink Table API `LEFT JOIN ... FOR SYSTEM_TIME AS OF
+  eq.proc` against the Paimon catalog; the planner picks Paimon's
+  `FileStoreLookupFunction` for per-row indexed nested-loop probes via the
+  `.lookup` SST sidecars.
+- **Delete-file write** — on Flink TaskManagers via the
+  `StreamingWriteDeleteFilesOperator`, keyed by `data_file_path`; each subtask
+  flushes its slice at the checkpoint barrier.
+- **Deployment** — a launcher pod plus a long-lived Flink session cluster
+  (`FlinkDeployment` CR managed by `flink-kubernetes-operator`); the launcher
+  submits one long-lived autonomous job per table via `RestClusterClient` and
+  restarts any that die.
 
 ## Why convert eq-deletes asynchronously?
 
@@ -108,9 +108,9 @@ Eq-delete files whose schema doesn't match the declared primary keys, or
 whose partitioning doesn't match the table's, are skipped — they stay in the
 table and are not part of the walk.
 
-Idempotency falls out of the design: secondary-index writes are upserts on
-`(spec_id, partition_key, pk)` (Cassandra) or PK upserts on the same key
-(Paimon). A crash before the watermark advances replays the same rows. A
+Idempotency falls out of the design: secondary-index writes are PK upserts on
+`(spec_id, partition_key, pk)` in Paimon. A crash before the watermark advances
+replays the same rows. A
 crash after a successful eq-delete → DV commit, before the watermark
 advances, lands on the next pass with the eq-delete files already gone — the
 planner simply moves on.
@@ -120,42 +120,12 @@ snapshot summary.
 
 ## Architecture
 
-The two backends share the planner, conversion committer, and per-task delete-file writers, but drive
-them differently. **Spark + Cassandra** uses a shared master control loop in the driver pod;
-**Flink + Paimon** does not — its launcher pod only submits one long-lived autonomous job per table to
-a Flink session cluster, and each job is self-driving (its source walks the planner, its committer
-commits and advances the watermark; see [`STREAMING_CONVERTER.md`](STREAMING_CONVERTER.md)).
+The launcher pod submits one long-lived autonomous job per table to a Flink
+session cluster, and each job is self-driving: its source walks the planner, its
+committer commits and advances the watermark (see
+[`STREAMING_CONVERTER.md`](STREAMING_CONVERTER.md)).
 
-### Spark + Cassandra: shared master loop
-
-```
-                      ┌────────────────────────────────────┐
-                      │  Iceberg REST catalog (S3/MinIO)   │
-                      └────────────────────────────────────┘
-                              ▲                ▲
-                  loadTable() │                │ RowDelta commit
-                              │                │
-        ┌─────────────────────┴────────────────┴──────────────────────┐
-        │  icestream master (in-pod Spark driver)                      │
-        │                                                             │
-        │   MasterLoop ──► TableProcessor (one run per call)          │
-        │                  │                                          │
-        │                  ├─ SnapshotPlanner    (kind-homogeneous   │
-        │                  │                      runs over the walk) │
-        │                  │                                          │
-        │                  ├─ DataIndexer        (Spark)             │
-        │                  │                                          │
-        │                  └─ DeleteConverter    (Spark)             │
-        │                                                             │
-        └──────────────────────────────────┬──────────────────────────┘
-                                           │
-                       ┌───────────────────┴───────────────────┐
-                       │  Cassandra (LOCAL_QUORUM)              │
-                       │   one CQL table per iceberg table      │
-                       └────────────────────────────────────────┘
-```
-
-### Flink + Paimon: launcher + one autonomous job per table
+### Launcher + one autonomous job per table
 
 ```
                       ┌────────────────────────────────────┐
@@ -194,23 +164,10 @@ committed store state (the iceberg watermark + the Paimon snapshot).
 
 ### Index schema
 
-Both backends key the secondary index on `(spec_id, partition_key, pk)` plus
-the index-bucket configuration. The encoding of `partition_key` and `pk` is
-the same avro `StructLike` byte representation, computed in
+The secondary index is keyed on `(spec_id, partition_key, pk)` plus the
+index-bucket configuration. The encoding of `partition_key` and `pk` derives
+from the avro `StructLike` byte representation, computed in
 `io.github.jordepic.icestream.index.IndexEncoding`.
-
-**Spark + Cassandra**:
-
-| Role             | Column                       | Notes                                                    |
-|------------------|------------------------------|----------------------------------------------------------|
-| Partition key    | `spec_id`                    | Iceberg data-file `PartitionSpec` id.                    |
-| Partition key    | `partition_key`              | Avro-encoded `StructLike` bytes (`blob`).                |
-| Partition key    | `bucket`                     | `hash(pk_cols) mod N`, salting hot iceberg partitions.   |
-| Clustering key   | `pk` (`serialized_delete_condition`) | Avro-encoded pk-column values (`blob`).          |
-| Value            | `data_file_path`             | Full path of the data file.                              |
-| Value            | `pos`                        | Row position in data file (`bigint`).                    |
-
-**Flink + Paimon**:
 
 | Role             | Column                       | Notes                                                    |
 |------------------|------------------------------|----------------------------------------------------------|
@@ -249,35 +206,23 @@ in/out (set them as index-table options):
 
 - **Async + persistent index**: amortize indexing over time; conversions
   become indexed lookups instead of full data-file rescans.
-- **Two backends sharing one core**: planner, conversion committer, and
-  per-task delete-file writers (`PerTaskDvWriter`, `PerTaskPosDeleteWriter`)
-  live in `icestream-common`. Backends differ in how they connect compute to
-  index storage and how they drive the walk — Spark + Cassandra uses the shared
-  master loop; Flink + Paimon's source/committer drive their own walk inside
-  each autonomous job.
-- **Engine-native indexed-NL join**:
-  - Spark+Cassandra: the connector pushes the partition+pk equality into a
-    Cassandra lookup, so Spark's stage is a stream of indexed point-probes,
-    not a shuffle-heavy join.
-  - Flink+Paimon: `FOR SYSTEM_TIME AS OF` against the Paimon catalog makes
-    the planner pick `LookupJoin` against `FileStoreLookupFunction`, which
-    probes the per-bucket `.lookup` SST sidecars per row. (Flink's planner
-    only picks `LookupJoin` when the right side is a fixed-bucket PK
-    table joined on the full PK; the converter test asserts this.)
+- **Engine-native indexed-NL join**: `FOR SYSTEM_TIME AS OF` against the Paimon
+  catalog makes the planner pick `LookupJoin` against `FileStoreLookupFunction`,
+  which probes the per-bucket `.lookup` SST sidecars per row. (Flink's planner
+  only picks `LookupJoin` when the right side is a fixed-bucket PK table joined
+  on the full PK; the converter test asserts this.)
 
 ## Architectural decisions
 
 These are the load-bearing choices the codebase commits to.
 
-1. **Multi-impl module split.** `icestream-common` holds engine-agnostic
-   logic (planner, schema, the master loop used by the Spark backend, iceberg
-   readers, conversion committer, `PerTaskDvWriter`/`PerTaskPosDeleteWriter`,
-   `DeleteFileCreatorSupport`, `FileWorkItem`, `EnvConfig`,
-   `LifecycleHooks`). The two backends implement common interfaces
-   (`IndexBackend`, `DataIndexer`, `DeleteConverter`).
-2. **Hard-cut property rename**: the bucketing knob is
-   `icestream.index-buckets` (was `icestream.cassandra-buckets`); both
-   backends route it into their respective storage's bucketing mechanism.
+1. **Module split.** `icestream-common` holds engine-agnostic logic (planner,
+   schema, iceberg readers, conversion committer,
+   `PerTaskDvWriter`/`PerTaskPosDeleteWriter`, `DeleteFileCreatorSupport`,
+   `FileWorkItem`, `EnvConfig`, `LifecycleHooks`); `icestream-flink-paimon`
+   wires it to Flink compute and the Paimon index store.
+2. **Bucketing knob** is `icestream.index-buckets`, routed into Paimon's
+   `bucket = N` fixed-bucket mode.
 3. **Hex-encoded partition_key / pk in Paimon**: Paimon's lookup machinery
    needs Comparable PK columns and renders partition values into the path
    string. Hex is byte-order-preserving and path-safe.
@@ -300,17 +245,15 @@ These are the load-bearing choices the codebase commits to.
    coordinate only through committed store state (iceberg watermark + Paimon
    snapshot) — there is no master loop driving the work and no dial-back
    channel. The launcher pod makes only outbound connections.
-8. **Greenfield deployment assumed**: no Cassandra → Paimon migration
-   tooling; pick a backend and stick with it.
 
 ## Configuration
 
-### Per-table iceberg properties (universal)
+### Per-table iceberg properties
 
 | Property                       | Required | Default    | Meaning                                                  |
 |--------------------------------|----------|------------|----------------------------------------------------------|
 | `icestream.primary-keys`       | yes      | —          | Comma-separated pk columns. Presence opts the table in.  |
-| `icestream.index-buckets`      | no       | `1`        | `N` for the per-partition bucket spread. Cassandra: salt. Paimon: `bucket = N` (must be > 0 for lookup join). |
+| `icestream.index-buckets`      | no       | `1`        | Paimon `bucket = N` for the per-partition bucket spread (must be > 0 for lookup join). |
 
 State written by icestream (do not edit):
 
@@ -320,32 +263,13 @@ State written by icestream (do not edit):
 | `icestream.last-processed-kind`              | `DATA` or `EQ_DEL` — kind of last processed run.         |
 | `icestream.pinned-primary-keys`              | Snapshot of pk set at last successful commit.            |
 | `icestream.pinned-index-buckets`             | Snapshot of bucket count at last successful commit.      |
-| `icestream.last-indexed-paimon-snapshot`     | (Flink+Paimon only) snapshot the converter's lookup join pins to. |
+| `icestream.last-indexed-paimon-snapshot`     | Snapshot the converter's lookup join pins to.            |
 
 Pinned-* properties exist so `SnapshotPlanner` detects a configuration change
 between watermark commits and fails loud rather than silently corrupting the
 index.
 
-### Spark + Cassandra master process (env vars)
-
-Read once at startup. Iceberg catalog comes from the SparkSession via
-`spark.sql.catalog.<ICESTREAM_CATALOG_NAME>.*` Spark properties.
-
-| Variable                                  | Required | Default     |
-|-------------------------------------------|----------|-------------|
-| `ICESTREAM_CATALOG_NAME`                  | no       | `iceberg`   |
-| `ICESTREAM_CASSANDRA_HOST`                | yes      | —           |
-| `ICESTREAM_CASSANDRA_PORT`                | no       | `9042`      |
-| `ICESTREAM_CASSANDRA_LOCAL_DC`            | yes      | —           |
-| `ICESTREAM_KEYSPACE`                      | no       | `icestream` |
-| `ICESTREAM_POLL_INTERVAL_SECONDS`         | no       | `10`        |
-| `ICESTREAM_IDLE_BACKOFF_SECONDS`          | no       | `60`        |
-| `ICESTREAM_MAX_CONCURRENT_TASKS`          | no       | `4`         |
-
-Per-table-only knob: `icestream.cassandra-partitions-per-host` (Spark write
-partitions per Cassandra replica, default `10`).
-
-### Flink + Paimon launcher (env vars)
+### Launcher (env vars)
 
 Read once at startup by `FlinkMain`. The iceberg catalog is built directly via
 `CatalogUtil.loadCatalog`. Free-form catalog options arrive as
@@ -374,19 +298,7 @@ normalization: lowercase, `_` → `.`).
 dev). `remote` submits each autonomous job via `RestClusterClient` to a
 long-lived session cluster.
 
-## Helm charts
-
-One chart per backend.
-
-```
-helm install icestream-spark-cassandra ./icestream-spark-cassandra/helm \
-  --set image.repository=icestream/icestream-spark-cassandra-master \
-  --set image.tag=1.0-SNAPSHOT \
-  --set appConfig.catalog.uri=http://iceberg-rest:8181 \
-  --set appConfig.catalog.warehouse=s3://warehouse/ \
-  --set appConfig.cassandra.host=cassandra \
-  --set appConfig.cassandra.localDc=datacenter1
-```
+## Helm chart
 
 ```
 helm install icestream-flink-paimon ./icestream-flink-paimon/helm \
@@ -437,24 +349,21 @@ These are deliberate v1 simplifications, not permanent constraints.
 - **Only fully-convertible eq-deletes are processed.** Schema mismatches or
   unpartitioned eq-deletes in partitioned tables are skipped silently and
   stay in the table.
-- **Single launcher / master process.** Horizontal scale-out (sharding tables
-  across instances) is not implemented — the Spark backend runs one master, and
-  the Flink backend runs one launcher pod that supervises all per-table jobs.
+- **Single launcher process.** Horizontal scale-out (sharding tables across
+  instances) is not implemented — one launcher pod supervises all per-table
+  jobs.
 
 ## Tests
 
-- `icestream-common` — engine-agnostic core; tested via the backend modules
-  that depend on it.
-- `icestream-spark-cassandra` — unit tests run against a testcontainers
-  Cassandra and an in-process Spark.
+- `icestream-common` — engine-agnostic core; tested via `icestream-flink-paimon`
+  which depends on it.
 - `icestream-flink-paimon` — unit tests run in-process against Paimon's
   filesystem catalog and a Flink `MiniCluster`; includes
   `lookupJoinPlanUsesPaimonFileStoreLookupFunction` asserting Flink's planner
   picks `LookupJoin` (not a fallback hash join).
-- `icestream-it` — two end-to-end docker-compose ITs:
-  `IcestreamSparkCassandraEndToEndIT` and `IcestreamFlinkPaimonEndToEndIT`,
-  each running Kafka + Flink upsert ingestion + the corresponding backend
-  for ~60 s and asserting that every snapshot tagged
+- `icestream-it` — the end-to-end docker-compose IT
+  `IcestreamFlinkPaimonEndToEndIT`, running Kafka + Flink upsert ingestion + the
+  converter for ~60 s and asserting that every snapshot tagged
   `icestream-converted=true` has the same visible row set as its parent.
 
 ## Benchmark (Flink + Paimon, distributed cluster)

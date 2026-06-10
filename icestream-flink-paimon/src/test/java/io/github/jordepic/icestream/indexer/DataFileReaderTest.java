@@ -1,4 +1,4 @@
-package io.github.jordepic.icestream.sparkcassandra.indexer;
+package io.github.jordepic.icestream.indexer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 

@@ -14,8 +14,7 @@
     <description>
         Engine-agnostic icestream core: planner, schema/properties, master loop,
         iceberg readers, the conversion committer, and per-task delete-file writers.
-        Depends only on iceberg's java APIs. Both icestream-spark-cassandra and
-        icestream-flink-paimon link against this.
+        Depends only on iceberg's java APIs. icestream-flink-paimon links against this.
     </description>
 
     <dependencies>

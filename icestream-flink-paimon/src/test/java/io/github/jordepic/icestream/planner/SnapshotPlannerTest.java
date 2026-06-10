@@ -1,4 +1,4 @@
-package io.github.jordepic.icestream.sparkcassandra.planner;
+package io.github.jordepic.icestream.planner;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;

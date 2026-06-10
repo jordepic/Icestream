@@ -1,4 +1,4 @@
-package io.github.jordepic.icestream.sparkcassandra.converter;
+package io.github.jordepic.icestream.converter;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;

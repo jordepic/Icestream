@@ -11,7 +11,6 @@
 
     <modules>
         <module>icestream-common</module>
-        <module>icestream-spark-cassandra</module>
         <module>icestream-flink-paimon</module>
         <module>icestream-it</module>
     </modules>
@@ -30,11 +29,6 @@
         <paimon.version>1.4.1</paimon.version>
         <kafka.client.version>3.7.0</kafka.client.version>
         <parquet.version>1.17.0</parquet.version>
-        <spark.version>3.5.4</spark.version>
-        <spark.scala.version>2.12</spark.scala.version>
-        <spark.major.version>3.5</spark.major.version>
-        <cassandra.connector.version>3.5.1</cassandra.connector.version>
-        <cassandra.driver.version>4.17.0</cassandra.driver.version>
         <jackson.version>2.15.2</jackson.version>
         <guava.version>33.3.1-jre</guava.version>
         <slf4j.version>2.0.13</slf4j.version>

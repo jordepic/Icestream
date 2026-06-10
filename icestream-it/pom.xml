@@ -13,27 +13,9 @@
 
     <properties>
         <flink.lib.directory>${project.build.directory}/flink-lib</flink.lib.directory>
-        <spark.compaction.lib.directory>${project.build.directory}/spark-compaction-lib</spark.compaction.lib.directory>
     </properties>
 
     <dependencies>
-        <dependency>
-            <groupId>io.github.jordepic</groupId>
-            <artifactId>icestream-spark-cassandra</artifactId>
-            <version>${project.version}</version>
-            <scope>test</scope>
-            <exclusions>
-                <!-- iceberg-spark-runtime is a shaded fat jar that ships its own
-                     org.apache.iceberg.PartitionData with shaded avro return types.
-                     icestream-spark-cassandra uses iceberg-core APIs directly so the runtime fat
-                     jar is not needed at IT test time, and including it conflicts with the
-                     real iceberg-core PartitionData on the classpath. -->
-                <exclusion>
-                    <groupId>org.apache.iceberg</groupId>
-                    <artifactId>iceberg-spark-runtime-3.5_2.12</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
         <dependency>
             <groupId>io.github.jordepic</groupId>
             <artifactId>icestream-flink-paimon</artifactId>
@@ -72,21 +54,6 @@
             <scope>test</scope>
         </dependency>
 
-        <!-- Spark is `provided` in icestream (lives in the apache/spark base image) so it
-             does not transit; declare it explicitly for the IT JVM. -->
-        <dependency>
-            <groupId>org.apache.spark</groupId>
-            <artifactId>spark-core_${spark.scala.version}</artifactId>
-            <version>${spark.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.spark</groupId>
-            <artifactId>spark-sql_${spark.scala.version}</artifactId>
-            <version>${spark.version}</version>
-            <scope>test</scope>
-        </dependency>
-
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>kafka-clients</artifactId>
@@ -109,12 +76,6 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers</artifactId>
-            <version>${testcontainers.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>cassandra</artifactId>
             <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
@@ -190,29 +151,6 @@
                             </artifactItems>
                         </configuration>
                     </execution>
-                    <execution>
-                        <id>copy-spark-compaction-lib-jars</id>
-                        <phase>process-test-resources</phase>
-                        <goals>
-                            <goal>copy</goal>
-                        </goals>
-                        <configuration>
-                            <outputDirectory>${spark.compaction.lib.directory}</outputDirectory>
-                            <stripVersion>false</stripVersion>
-                            <artifactItems>
-                                <artifactItem>
-                                    <groupId>org.apache.iceberg</groupId>
-                                    <artifactId>iceberg-spark-runtime-${spark.major.version}_${spark.scala.version}</artifactId>
-                                    <version>${iceberg.version}</version>
-                                </artifactItem>
-                                <artifactItem>
-                                    <groupId>org.apache.iceberg</groupId>
-                                    <artifactId>iceberg-aws-bundle</artifactId>
-                                    <version>${iceberg.version}</version>
-                                </artifactItem>
-                            </artifactItems>
-                        </configuration>
-                    </execution>
                 </executions>
             </plugin>
 
@@ -237,7 +175,6 @@
                     </argLine>
                     <systemPropertyVariables>
                         <icestream.it.flinkLibDir>${flink.lib.directory}</icestream.it.flinkLibDir>
-                        <icestream.it.sparkCompactionLibDir>${spark.compaction.lib.directory}</icestream.it.sparkCompactionLibDir>
                     </systemPropertyVariables>
                     <includes>
                         <include>**/*IT.java</include>
