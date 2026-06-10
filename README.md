@@ -1,34 +1,45 @@
 # icestream
 
-Asynchronous secondary-index service that efficiently converts Apache Iceberg
-**equality deletes** into the table's preferred row-level delete format —
-**deletion vectors** for V3 tables, **positional delete files** for V2 tables —
-without blocking the writer that produced them. The format is picked per-table
-from `format-version`. The conversion leverages a distributed index of iceberg
-data files, built on **Apache Flink** for compute and **Apache Paimon** for
-index storage.
+Iceberg tables can mark rows as invalidated by:
+- Positional deletes/deletion vectors (marks one row in one data file as removed)
+- Equality deletes (removes a row by condition, e.g. where id = 10)
 
-## Design
+When configured with "primary key semantics", all OSS iceberg streaming
+engines will emit one equality delete per incoming data row to ensure
+the target table contains no duplicate data. These deletes are joined
+to the table at query time and slow query performance until the data is
+compacted. By contrast, having a single positional delete file/deletion vector
+marking data file rows as invalidated yields much better query performance.
 
-A single Flink + Paimon system. The secondary index is an Apache Paimon
-primary-key table on the same object store as the iceberg warehouse (one PK
-table per iceberg table); compute runs on Apache Flink (DataStream + Table API).
-The work is driven by one long-lived **autonomous job per table** rather than a
-central control loop (see [`STREAMING_CONVERTER.md`](STREAMING_CONVERTER.md)):
+IceStream is an asynchronous secondary-index service that efficiently
+converts Apache Iceberg **equality deletes** into the table's preferred
+row-level delete format — **deletion vectors** for V3 tables, **positional
+delete files** for V2 tables. Not only does it not block the streaming writer
+from committing new data, it also can be used alongside any combination of
+batch/streaming engines.
 
-- **Indexer write** — a Flink batch sink (`FlinkSinkBuilder.forRowData`) upserts
-  data-file rows into the Paimon PK table; the Paimon writer auto-compacts.
-- **Eq-delete join** — a Flink Table API `LEFT JOIN ... FOR SYSTEM_TIME AS OF
-  eq.proc` against the Paimon catalog; the planner picks Paimon's
-  `FileStoreLookupFunction` for per-row indexed nested-loop probes via the
-  `.lookup` SST sidecars.
-- **Delete-file write** — on Flink TaskManagers via the
-  `StreamingWriteDeleteFilesOperator`, keyed by `data_file_path`; each subtask
-  flushes its slice at the checkpoint barrier.
-- **Deployment** — a launcher pod plus a long-lived Flink session cluster
-  (`FlinkDeployment` CR managed by `flink-kubernetes-operator`); the launcher
-  submits one long-lived autonomous job per table via `RestClusterClient` and
-  restarts any that die.
+The conversion leverages a distributed secondary index of iceberg data.
+This allows us to efficiently resolve which rows equality deletes resolve
+to and convert them to positional deletes accordingly.
+
+Let's evaluate time complexity. Imagine we wanted to convert a file with
+D equality deletes which applied to a data partition with N rows. We'll
+compare different join strategies
+- Sort Merge Join
+  - O(D log D + N log N + D + N) -> sort both sides and loop through
+- Hash Join
+  - O(D + N) -> linear scan to build hash map, linear scan to probe it
+- Nested Loop Lookup Join (what IceStream does)
+  - O(D * log N) -> on each deletion row do index lookup to find matching data
+
+When D << N (as is the case in very large tables with incrementally flushed
+equality deletes) a nested loop lookup join can be **orders of magnitude
+faster**! The sooner this conversion runs, the sooner you can read fresh
+data with low penalty.
+
+IceStream employs a diskless architecture - its index is an **Apache
+Paimon** table which contains SSTable files on object store. It uses
+**Apache Flink** for both building and querying the index.
 
 ## Why convert eq-deletes asynchronously?
 
@@ -57,20 +68,36 @@ time, retries conversions without penalizing the writer, and absorbs
 compaction-induced churn (rewrites, dangling deletes) without coupling them
 to the producer's critical path.
 
-### Prior art
+## Design
 
-- **[Apache Amoro](https://github.com/apache/amoro)** does this as part of
-  its optimizer
-  ([`AbstractRewriteFilesExecutor.equalityToPosition`](https://github.com/apache/amoro/blob/master/amoro-format-iceberg/src/main/java/org/apache/amoro/optimizing/AbstractRewriteFilesExecutor.java)).
-  Re-reads each affected data file every run; no persistent index, no DV
-  path.
-- **[Mooncake-Labs/moonlink](https://github.com/Mooncake-Labs/moonlink)**
-  maintains a similar pk → position mapping but synchronously inside a
-  Postgres CDC pipeline — bounded by one Postgres instance's write rate.
+A single Flink + Paimon system. The secondary index is an Apache Paimon
+primary-key table on the same object store as the iceberg warehouse (one PK
+table per iceberg table); compute runs on Apache Flink (DataStream + Table API).
+The work is driven by one long-lived **autonomous job per table** rather than a
+central control loop.
 
-icestream is the asynchronous, persistent-index version of the same idea.
-Each conversion is an indexed lookup against the secondary index instead of a
-full data-file rescan.
+- **Indexer write** — a Flink batch sink upserts data-file rows into a Paimon
+  primary key table where the "key" is the logical iceberg row key. Each Paimon
+  row contains the iceberg row's key plus its data file name and position.
+- **Eq-delete join** — Flink reads equality deletes into memory and uses
+  a nested lookup join to efficiently fetch the data file and positions of
+  matching rows.
+- **Delete-file write** — Flink aggregates the positions of rows to remove
+  and emits position deletes/deletion vectors.
+- **Deployment** — One job per table on a long-lived flink session cluster
+  plus an individual pod that schedules new tables on to it.
+
+### Existing solutions
+
+- **[Apache Amoro](https://github.com/apache/amoro)** does this as part of its optimizer, but employs
+  no index.
+- **[Mooncake-Labs/moonlink](https://github.com/Mooncake-Labs/moonlink)** keeps an in-memory secondary index in 
+  a single postgres node. This doesn't scale. They were also acquired by
+  DataBricks and are no longer open source.
+
+IceStream is the asynchronous, horizontally scalable version of the same idea.
+Each equality delete -> positional delete conversion is an indexed lookup 
+against the secondary index instead of a full data-file rescan.
 
 ## Algorithm
 
@@ -78,18 +105,17 @@ Per polling sweep, for each table opted in via `icestream.primary-keys`:
 
 1. Read the watermark from table properties:
    `(icestream.last-processed-sequence, icestream.last-processed-kind)` where
-   kind is `DATA` (data files) or `EQ_DEL` (equality-delete files).
-   Positional-delete files / DVs are not in the walk; they're consulted only
-   at data-block read time so we don't index already-deleted rows.
-2. Starting from the watermark, find the longest contiguous run of files of
-   a single kind, possibly spanning multiple sequence numbers. Within the
-   same sequence number, eq-delete files sort before data files.
+   kind is `DATA` (data files to index) or `EQ_DEL` (equality-delete files
+   to convert). Ignore positional deletes and deletion vectors.
+2. Starting from the last processed sequence number, process the longest
+   contiguous sequence of data files or equality deletes. If there are
+   both at the same sequence number, equality deletes are converted first.
 3. Process the run, one run per call:
 
-   **Data files**: read the files at the run's max seq (applying only
+   **Data files**: read the files at the run's max seq (applying
    pos-deletes / DVs at seq ≤ max), project to the pk schema, and
    upsert `(spec_id, partition_key, pk) → (data_file, pos)` into the
-   secondary index. Indexing _at the run's max seq_ ensures any later
+   secondary index. Indexing in file sequence number order ensures any
    eq-delete at a higher seq sees an index entry it can convert against.
 
    **Eq-delete files**: read them in the compute engine, join against the
@@ -98,32 +124,27 @@ Per polling sweep, for each table opted in via `icestream.primary-keys`:
    row-level delete for that file. Commit as a single `RowDelta` — on V3 the
    merged file is a DV, on V2 it's a positional-delete file.
    `validateFromSnapshot` + `validateDeletedFiles` make the commit fail
-   cleanly if a concurrent compaction rewrote any targeted file; we retry on
-   the next snapshot.
+   cleanly if a concurrent compaction modified/removed an existing row-level
+   delete that we touch.
 
 4. Advance the watermark to `(run.maxSeq, run.kind)` only after the work
    commits.
 
 Eq-delete files whose schema doesn't match the declared primary keys, or
-whose partitioning doesn't match the table's, are skipped — they stay in the
-table and are not part of the walk.
+whose partitioning doesn't match the table's, are not considered for
+conversion.
 
-Idempotency falls out of the design: secondary-index writes are PK upserts on
-`(spec_id, partition_key, pk)` in Paimon. A crash before the watermark advances
-replays the same rows. A
-crash after a successful eq-delete → DV commit, before the watermark
-advances, lands on the next pass with the eq-delete files already gone — the
-planner simply moves on.
+All of our operations are idempotent.
 
-icestream commits are identifiable by `icestream-converted=true` in the
+IceStream commits are identifiable by `icestream-converted=true` in the
 snapshot summary.
 
 ## Architecture
 
 The launcher pod submits one long-lived autonomous job per table to a Flink
-session cluster, and each job is self-driving: its source walks the planner, its
-committer commits and advances the watermark (see
-[`STREAMING_CONVERTER.md`](STREAMING_CONVERTER.md)).
+session cluster, and each job is self-driving: its flink source walks the planner,
+its committer commits and advances the last-processed-sequence-number iceberg
+table property.
 
 ### Launcher + one autonomous job per table
 
@@ -159,8 +180,7 @@ committer commits and advances the watermark (see
 ```
 
 The launcher only discovers tables and keeps one job per table submitted and alive; it does **not**
-drive index/convert work and there is no RPC channel — the source and committer coordinate through
-committed store state (the iceberg watermark + the Paimon snapshot).
+drive index/convert work.
 
 ### Index schema
 
@@ -181,11 +201,11 @@ from the avro `StructLike` byte representation, computed in
 
 #### Lookup-cache tuning (Flink + Paimon)
 
-This cache only earns its keep because each table's Flink job is **one long-lived autonomous job**,
-not a fresh job per run. The per-bucket `.lookup` SSTs are materialized (or downloaded, with remote
-lookup files) and their pages warmed *once*, then reused across every run the standing job serves; a
-job-per-run would re-pay that cold start each time — the SST download dominates (~5–25× slower in
-benchmarks; see [Benchmark](#benchmark-flink--paimon-distributed-cluster)) — and throw the warm cache
+This cache is persistent because each table's Flink job is **one long-lived streaming job**.
+The per-bucket `.lookup` SSTs are materialized (or downloaded, with remote lookup files) and their
+pages warmed *once*, then reused across every run the standing job serves; a job-per-run would re-pay
+that cold start each time — the SST download dominates (~5–25× slower in benchmarks; see
+[Benchmark](#benchmark-flink--paimon-distributed-cluster)) — and throw the warm cache
 away between runs. That's the core reason the job is long-lived: the toggles below govern a cache that
 persists for the life of the job.
 
@@ -199,52 +219,7 @@ in/out (set them as index-table options):
   before it's deleted. Raise it so a bursty/idle converter doesn't drop its warm files between runs.
 - `lookup.cache-max-disk-size` (default **unlimited**) — local-disk budget for the lookup files. Left
   unlimited, files accumulate until the physical disk fills (a hard failure). Set a budget ≤ free disk
-  so Paimon LRU-evicts instead; on a huge index the evicted file is then re-materialized on next probe
-  (rebuilt from the data file, or downloaded if remote lookup files are enabled).
-
-### Why this design
-
-- **Async + persistent index**: amortize indexing over time; conversions
-  become indexed lookups instead of full data-file rescans.
-- **Engine-native indexed-NL join**: `FOR SYSTEM_TIME AS OF` against the Paimon
-  catalog makes the planner pick `LookupJoin` against `FileStoreLookupFunction`,
-  which probes the per-bucket `.lookup` SST sidecars per row. (Flink's planner
-  only picks `LookupJoin` when the right side is a fixed-bucket PK table joined
-  on the full PK; the converter test asserts this.)
-
-## Architectural decisions
-
-These are the load-bearing choices the codebase commits to.
-
-1. **Module split.** `icestream-common` holds engine-agnostic logic (planner,
-   schema, iceberg readers, conversion committer,
-   `PerTaskDvWriter`/`PerTaskPosDeleteWriter`, `DeleteFileCreatorSupport`,
-   `FileWorkItem`, `EnvConfig`, `LifecycleHooks`); `icestream-flink-paimon`
-   wires it to Flink compute and the Paimon index store.
-2. **Bucketing knob** is `icestream.index-buckets`, routed into Paimon's
-   `bucket = N` fixed-bucket mode.
-3. **Hex-encoded partition_key / pk in Paimon**: Paimon's lookup machinery
-   needs Comparable PK columns and renders partition values into the path
-   string. Hex is byte-order-preserving and path-safe.
-4. **Paimon table partitioned by `(spec_id, partition_key)`** so the lookup
-   join prunes to the matching iceberg partition per probe row.
-5. **In-cluster collect of `TaskOutputs`, not match rows**: per-data-file
-   delete files are written on TaskManagers via
-   `StreamingWriteDeleteFilesOperator`; only the `TaskOutputs` (one per writer
-   subtask) flow to the job's parallelism-1 `RunCommitter`, where
-   `DeleteFileCreatorSupport.assemblePlan` produces the `CommitPlan`. The
-   commit and watermark advance happen inside the job, not in a driver.
-6. **Flink runtime: session mode on k8s via `flink-kubernetes-operator`.**
-   Application mode (one cluster per table) would dominate runtime with
-   cluster-startup. The launcher submits one long-lived autonomous job per
-   table to a shared session cluster and only resubmits a job if it dies.
-7. **Autonomous job, no central driver or RPC channel.** Each table's job is
-   self-driving: a parallelism-1 source walks the planner and emits one run per
-   checkpoint epoch, gated on the iceberg watermark; the parallelism-1
-   committer commits and advances that watermark. Source and committer
-   coordinate only through committed store state (iceberg watermark + Paimon
-   snapshot) — there is no master loop driving the work and no dial-back
-   channel. The launcher pod makes only outbound connections.
+  so Paimon LRU-evicts instead; on a huge index the evicted file is then re-downloaded on next probe.
 
 ## Configuration
 
@@ -255,7 +230,7 @@ These are the load-bearing choices the codebase commits to.
 | `icestream.primary-keys`       | yes      | —          | Comma-separated pk columns. Presence opts the table in.  |
 | `icestream.index-buckets`      | no       | `1`        | Paimon `bucket = N` for the per-partition bucket spread (must be > 0 for lookup join). |
 
-State written by icestream (do not edit):
+State written by icestream to iceberg table properties (do not edit):
 
 | Property                                     | Meaning                                                  |
 |----------------------------------------------|----------------------------------------------------------|
@@ -352,6 +327,8 @@ These are deliberate v1 simplifications, not permanent constraints.
 - **Single launcher process.** Horizontal scale-out (sharding tables across
   instances) is not implemented — one launcher pod supervises all per-table
   jobs.
+- **Unable to handle table time travel** The job is not currently capable
+  of re-indexing in response to time travel.
 
 ## Tests
 
